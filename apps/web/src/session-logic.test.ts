@@ -304,7 +304,6 @@ describe("deriveActivePlanState", () => {
     expect(deriveActivePlanState(activities, TurnId.make("turn-1"))).toBeNull();
   });
 });
-
 describe("findLatestProposedPlan", () => {
   it("prefers the latest proposed plan for the active turn", () => {
     expect(

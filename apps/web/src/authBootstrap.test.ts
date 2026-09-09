@@ -269,6 +269,62 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(attempts).toBe(4);
   });
 
+  it("recovers automatically when a bootstrap 500 is followed by a healthy session", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    const request = HttpClientRequest.get("http://localhost/api/auth/session");
+    const response = HttpClientResponse.fromWeb(
+      request,
+      new Response("Internal Server Error", { status: 500 }),
+    );
+    __setPrimaryHttpRunnerForTests(async <A>() => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new HttpClientError.HttpClientError({
+          reason: new HttpClientError.StatusCodeError({ request, response }),
+        });
+      }
+      return authenticatedSession(LOOPBACK_AUTH) as A;
+    });
+
+    const { resolveInitialServerAuthGateState } = await import("./environments/primary");
+    const gateState = resolveInitialServerAuthGateState();
+    await vi.advanceTimersByTimeAsync(500);
+
+    await expect(gateState).resolves.toEqual({ status: "authenticated" });
+    expect(attempts).toBe(2);
+  });
+
+  it("manual retry clears a failed auth bootstrap before probing again", async () => {
+    vi.useFakeTimers();
+    let healthy = false;
+    const request = HttpClientRequest.get("http://localhost/api/auth/session");
+    const response = HttpClientResponse.fromWeb(
+      request,
+      new Response("Internal Server Error", { status: 500 }),
+    );
+    __setPrimaryHttpRunnerForTests(async <A>() => {
+      if (!healthy) {
+        throw new HttpClientError.HttpClientError({
+          reason: new HttpClientError.StatusCodeError({ request, response }),
+        });
+      }
+      return authenticatedSession(LOOPBACK_AUTH) as A;
+    });
+
+    const { retryInitialServerAuthGateState, resolveInitialServerAuthGateState } =
+      await import("./environments/primary");
+    const failed = resolveInitialServerAuthGateState();
+    const failedAssertion = expect(failed).rejects.toMatchObject({ status: 500 });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await failedAssertion;
+
+    healthy = true;
+    await expect(retryInitialServerAuthGateState()).resolves.toEqual({
+      status: "authenticated",
+    });
+  });
+
   it("takes a pairing token from the location hash and strips it immediately", async () => {
     const testWindow = installTestBrowser("http://localhost/#token=pairing-token");
     const { takePairingTokenFromUrl } = await import("./environments/primary");
@@ -308,63 +364,6 @@ describe("resolveInitialServerAuthGateState", () => {
     });
     expect(testApi.calls.browserSession).toEqual([{ credential: "retry-token" }]);
     expect(testApi.calls.session).toBe(2);
-  });
-
-  it("keeps manual token submission pending until the session is authenticated", async () => {
-    vi.useFakeTimers();
-    let authenticated = false;
-    let settled = false;
-    try {
-      const testApi = await installAuthApi({
-        session: () =>
-          authenticated
-            ? authenticatedSession(LOOPBACK_AUTH)
-            : unauthenticatedSession(LOOPBACK_AUTH),
-        browserSession: () => Effect.succeed(browserSession(["orchestration:read"])),
-      });
-      const { submitServerAuthCredential } = await import("./environments/primary");
-
-      const submission = submitServerAuthCredential("retry-token").finally(() => {
-        settled = true;
-      });
-      await vi.advanceTimersByTimeAsync(0);
-
-      expect(testApi.calls.browserSession).toEqual([{ credential: "retry-token" }]);
-      expect(testApi.calls.session).toBe(1);
-      expect(settled).toBe(false);
-
-      authenticated = true;
-      await vi.advanceTimersByTimeAsync(100);
-      await expect(submission).resolves.toBeUndefined();
-      expect(testApi.calls.session).toBe(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("fails manual token submission when the session is not established", async () => {
-    vi.useFakeTimers();
-    try {
-      const testApi = await installAuthApi({
-        session: () => unauthenticatedSession(LOOPBACK_AUTH),
-        browserSession: () => Effect.succeed(browserSession(["orchestration:read"])),
-      });
-      const { PrimaryEnvironmentAuthSessionTimeoutError, submitServerAuthCredential } =
-        await import("./environments/primary/auth");
-
-      const submission = submitServerAuthCredential("retry-token");
-      const failure = submission.then(
-        () => null,
-        (error: unknown) => error,
-      );
-      await vi.advanceTimersByTimeAsync(2_000);
-
-      await expect(failure).resolves.toBeInstanceOf(PrimaryEnvironmentAuthSessionTimeoutError);
-      expect(testApi.calls.browserSession).toEqual([{ credential: "retry-token" }]);
-      expect(testApi.calls.session).toBeGreaterThan(1);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it("rejects a blank pairing token with a structured validation error", async () => {
@@ -427,10 +426,10 @@ describe("resolveInitialServerAuthGateState", () => {
       cause,
     });
 
-    expect(error.status).toBe(500);
+    expect(error.status).toBeNull();
     expect(error.cause).toBe(cause);
     expect(error.message).toBe(
-      "Primary environment request failed during list-pairing-links (HTTP 500).",
+      "Primary environment request failed during list-pairing-links because the environment transport was unavailable.",
     );
     expect(error.message).not.toContain(cause.message);
   });

@@ -45,6 +45,7 @@ const ProviderRequestId = TrimmedNonEmptyStringSchema;
 export type ProviderRequestId = typeof ProviderRequestId.Type;
 
 const ProviderRefs = Schema.Struct({
+  providerThreadId: Schema.optional(TrimmedNonEmptyStringSchema),
   providerTurnId: Schema.optional(TrimmedNonEmptyStringSchema),
   providerItemId: Schema.optional(ProviderItemId),
   providerRequestId: Schema.optional(ProviderRequestId),
@@ -103,7 +104,7 @@ const RuntimeErrorClass = Schema.Literals([
 ]);
 export type RuntimeErrorClass = typeof RuntimeErrorClass.Type;
 
-const TOOL_LIFECYCLE_ITEM_TYPES = [
+export const TOOL_LIFECYCLE_ITEM_TYPES = [
   "command_execution",
   "file_change",
   "mcp_tool_call",
@@ -141,6 +142,8 @@ export const CanonicalRequestType = Schema.Literals([
   "apply_patch_approval",
   "exec_command_approval",
   "mcp_elicitation_approval",
+  "permissions_approval",
+  "tool_approval",
   "tool_user_input",
   "dynamic_tool_call",
   "auth_tokens_refresh",
@@ -320,6 +323,10 @@ export const ThreadTokenUsageSnapshot = Schema.Struct({
   cachedInputTokens: Schema.optional(NonNegativeInt),
   outputTokens: Schema.optional(NonNegativeInt),
   reasoningOutputTokens: Schema.optional(NonNegativeInt),
+  cumulativeInputTokens: Schema.optional(NonNegativeInt),
+  cumulativeCachedInputTokens: Schema.optional(NonNegativeInt),
+  cumulativeOutputTokens: Schema.optional(NonNegativeInt),
+  cumulativeReasoningOutputTokens: Schema.optional(NonNegativeInt),
   lastUsedTokens: Schema.optional(NonNegativeInt),
   lastInputTokens: Schema.optional(NonNegativeInt),
   lastCachedInputTokens: Schema.optional(NonNegativeInt),
@@ -691,6 +698,16 @@ export const RuntimeTaskStatus = Schema.Literals([
 ]);
 export type RuntimeTaskStatus = typeof RuntimeTaskStatus.Type;
 
+export const RuntimeTaskLastTurn = Schema.Struct({
+  turnId: TurnId,
+  outcome: Schema.Literals(["completed", "failed", "interrupted"]),
+  completedAt: Schema.optional(IsoDateTime),
+  durationMs: Schema.optional(NonNegativeInt),
+  result: Schema.optional(TrimmedNonEmptyStringSchema),
+  error: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type RuntimeTaskLastTurn = typeof RuntimeTaskLastTurn.Type;
+
 const TaskProgressPayload = Schema.Struct({
   taskId: RuntimeTaskId,
   description: TrimmedNonEmptyStringSchema,
@@ -701,6 +718,7 @@ const TaskProgressPayload = Schema.Struct({
   /** Present on synthesized member/child progress rows that carry state. */
   status: Schema.optional(RuntimeTaskStatus),
   error: Schema.optional(TrimmedNonEmptyStringSchema),
+  lastTurn: Schema.optional(RuntimeTaskLastTurn),
   ...taskAgentLinkageFields,
 });
 export type TaskProgressPayload = typeof TaskProgressPayload.Type;

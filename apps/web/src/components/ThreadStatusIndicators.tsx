@@ -7,6 +7,7 @@ import {
   type VcsStatusResult,
 } from "@t3tools/contracts";
 import { FolderGit2Icon, TerminalIcon } from "lucide-react";
+import { Atom } from "effect/unstable/reactivity";
 import { useMemo } from "react";
 import { useEnvironment, usePrimaryEnvironmentId } from "../state/environments";
 import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
@@ -20,6 +21,7 @@ import { resolvePullRequestState } from "./pullRequest/pullRequestPresentation";
 import type { SidebarThreadSummary } from "../types";
 import { formatWorktreePathForDisplay } from "../worktreeCleanup";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
+import { appAtomRegistry } from "../rpc/atomRegistry";
 
 export interface PrStatusIndicator {
   label: string;
@@ -41,6 +43,123 @@ export type ThreadPr = VcsStatusResult["pr"];
 export interface LinkedThreadPullRequestStatus {
   readonly pr: NonNullable<ThreadPr>;
   readonly sourceControlProvider: NonNullable<VcsStatusResult["sourceControlProvider"]>;
+}
+
+export interface ThreadChangeRequestSnapshot {
+  readonly branch: string;
+  readonly pr: NonNullable<ThreadPr>;
+  readonly sourceControlProvider: VcsStatusResult["sourceControlProvider"] | undefined;
+}
+
+export const threadChangeRequestSnapshotsAtom = Atom.make<
+  ReadonlyMap<string, ThreadChangeRequestSnapshot>
+>(new Map()).pipe(Atom.keepAlive, Atom.withLabel("sidebar:thread-change-request-snapshots"));
+
+function isTerminalChangeRequestState(
+  state: NonNullable<ThreadPr>["state"],
+): state is "merged" | "closed" {
+  return state === "merged" || state === "closed";
+}
+
+export function setThreadChangeRequestSnapshot(
+  threadKey: string,
+  snapshot: ThreadChangeRequestSnapshot | null,
+): void {
+  appAtomRegistry.modify(threadChangeRequestSnapshotsAtom, (current) => {
+    const existing = current.get(threadKey);
+    if (snapshot === null) {
+      if (existing === undefined) return [false, current];
+      const next = new Map(current);
+      next.delete(threadKey);
+      return [true, next];
+    }
+    if (existing !== undefined && threadChangeRequestSnapshotsEqual(existing, snapshot))
+      return [false, current];
+    const next = new Map(current);
+    next.set(threadKey, snapshot);
+    return [true, next];
+  });
+}
+
+export function threadChangeRequestSnapshotsEqual(
+  left: ThreadChangeRequestSnapshot,
+  right: ThreadChangeRequestSnapshot,
+): boolean {
+  return (
+    left.branch === right.branch &&
+    left.pr.number === right.pr.number &&
+    left.pr.title === right.pr.title &&
+    left.pr.url === right.pr.url &&
+    left.pr.baseRef === right.pr.baseRef &&
+    left.pr.headRef === right.pr.headRef &&
+    left.pr.state === right.pr.state &&
+    (left.pr.updatedAt ?? null) === (right.pr.updatedAt ?? null) &&
+    left.sourceControlProvider?.kind === right.sourceControlProvider?.kind &&
+    left.sourceControlProvider?.name === right.sourceControlProvider?.name &&
+    left.sourceControlProvider?.baseUrl === right.sourceControlProvider?.baseUrl
+  );
+}
+
+export function nextThreadChangeRequestSnapshot(input: {
+  threadBranch: string | null;
+  gitStatus: VcsStatusResult | null;
+  snapshot: ThreadChangeRequestSnapshot | null | undefined;
+  retainTerminalOnBranchMismatch: boolean;
+}): ThreadChangeRequestSnapshot | null | undefined {
+  const { threadBranch, gitStatus, snapshot, retainTerminalOnBranchMismatch } = input;
+  if (gitStatus === null) return undefined;
+  if (threadBranch === null) return null;
+  if (gitStatus.refName !== threadBranch)
+    return retainTerminalOnBranchMismatch &&
+      snapshot != null &&
+      isTerminalChangeRequestState(snapshot.pr.state)
+      ? undefined
+      : null;
+  if (gitStatus.pr == null)
+    return retainTerminalOnBranchMismatch &&
+      snapshot != null &&
+      isTerminalChangeRequestState(snapshot.pr.state)
+      ? undefined
+      : null;
+  return {
+    branch: threadBranch,
+    pr: gitStatus.pr,
+    sourceControlProvider: gitStatus.sourceControlProvider,
+  };
+}
+
+export function resolveDisplayedThreadPr(input: {
+  threadBranch: string | null;
+  gitStatus: VcsStatusResult | null;
+  snapshot: ThreadChangeRequestSnapshot | null | undefined;
+  retainTerminalOnBranchMismatch: boolean;
+}): ThreadPr | null {
+  const { threadBranch, gitStatus, snapshot, retainTerminalOnBranchMismatch } = input;
+  if (threadBranch !== null && gitStatus?.refName === threadBranch && gitStatus.pr != null)
+    return gitStatus.pr;
+  return threadBranch !== null &&
+    retainTerminalOnBranchMismatch &&
+    snapshot != null &&
+    isTerminalChangeRequestState(snapshot.pr.state)
+    ? snapshot.pr
+    : null;
+}
+
+export function resolveDisplayedThreadPrProvider(input: {
+  threadBranch: string | null;
+  gitStatus: VcsStatusResult | null;
+  snapshot: ThreadChangeRequestSnapshot | null | undefined;
+  retainTerminalOnBranchMismatch: boolean;
+}): VcsStatusResult["sourceControlProvider"] | undefined {
+  const { threadBranch, gitStatus, snapshot, retainTerminalOnBranchMismatch } = input;
+  if (threadBranch !== null && gitStatus?.refName === threadBranch && gitStatus.pr != null)
+    return gitStatus.sourceControlProvider;
+  return threadBranch !== null &&
+    retainTerminalOnBranchMismatch &&
+    snapshot != null &&
+    isTerminalChangeRequestState(snapshot.pr.state)
+    ? snapshot.sourceControlProvider
+    : undefined;
 }
 
 /** Keep cached summaries visible when an offscreen row stops live queries. */

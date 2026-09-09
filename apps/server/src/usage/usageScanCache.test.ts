@@ -1,9 +1,11 @@
 import { describe, expect, it } from "@effect/vitest";
 
 import {
+  decodeScanCoverage,
   decodeScanCache,
   dedupeWithinFile,
   encodeScanCache,
+  planTranscriptScan,
   pruneScanCache,
   type CachedFile,
   type ScanCache,
@@ -29,16 +31,6 @@ function record(overrides: Partial<UsageRecord> = {}): UsageRecord {
   };
 }
 
-function position(overrides: Partial<CachedFile["position"]> = {}): CachedFile["position"] {
-  return {
-    resumeOffset: 120,
-    guardLength: 64,
-    guardHash: 0xdeadbeef,
-    codexState: null,
-    ...overrides,
-  };
-}
-
 function cacheWith(entries: readonly [string, number, readonly UsageRecord[]][]): ScanCache {
   const cache: ScanCache = new Map();
   for (const [path, mtimeMs, records] of entries) {
@@ -47,14 +39,29 @@ function cacheWith(entries: readonly [string, number, readonly UsageRecord[]][])
       mtimeMs,
       provider: "claude",
       records,
-      tailRecords: [],
-      position: position(),
     });
   }
   return cache;
 }
 
 describe("scan cache round trip", () => {
+  it("invalidates pre-cross-home-dedup caches", () => {
+    const encoded = encodeScanCache(
+      new Map([
+        [
+          "/codex.jsonl",
+          {
+            size: 10,
+            mtimeMs: 100,
+            provider: "codex" as const,
+            records: [record({ provider: "codex" })],
+          },
+        ],
+      ]),
+    );
+    expect(decodeScanCache({ ...JSON.parse(JSON.stringify(encoded)), version: 5 }).size).toBe(0);
+  });
+
   it("restores records unchanged", () => {
     const original = cacheWith([
       ["/a.jsonl", 100, [record(), record({ dedupeKey: "msg_2:", model: "claude-opus-5" })]],
@@ -63,29 +70,24 @@ describe("scan cache round trip", () => {
     original.set("/grok.jsonl", {
       size: 40,
       mtimeMs: 300,
-      provider: "grok",
+      provider: "opencode",
       records: [
-        record({ provider: "grok", model: "grok-4.5-build", dedupeKey: "s:p:grok-4.5-build" }),
+        record({ provider: "opencode", model: "opencode-build", dedupeKey: "s:p:opencode-build" }),
       ],
-      tailRecords: [record({ provider: "grok", model: "grok-4.5-build", dedupeKey: null })],
-      position: position({ resumeOffset: 30, guardLength: 30, guardHash: 123 }),
     });
     original.set("/codex.jsonl", {
       size: 80,
       mtimeMs: 400,
       provider: "codex",
       records: [record({ provider: "codex", model: "gpt-5.2-codex", dedupeKey: null })],
-      tailRecords: [],
-      position: position({
-        codexState: {
-          model: "gpt-5.2-codex",
-          sessionId: "session-c",
-          lastUsageSignature: '{"input_tokens":1}',
-          sawSessionMeta: true,
-          suppressingForkCopies: false,
-          forkCopyAnchorMs: 0,
-        },
-      }),
+      codexState: {
+        model: "gpt-5.2-codex",
+        sessionId: "session-c",
+        lastUsageSignature: '{"input_tokens":1}',
+        sawSessionMeta: true,
+        suppressingForkCopies: false,
+        forkCopyAnchorMs: 0,
+      },
     });
 
     const restored = decodeScanCache(JSON.parse(JSON.stringify(encodeScanCache(original))));
@@ -97,37 +99,66 @@ describe("scan cache round trip", () => {
     expect(restored.get("/codex.jsonl")).toEqual(original.get("/codex.jsonl"));
   });
 
-  it("drops an entry whose persisted parse state is corrupt", () => {
-    // Resuming with a bad reducer state would attach appended usage to the
-    // wrong model or replay fork-copied history; that entry must cold parse.
+  it("drops an entry whose persisted record row is corrupt", () => {
+    // A malformed compact row must cold parse rather than silently dropping
+    // or fabricating usage.
     const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]));
     const poisoned = {
       ...encoded,
       files: {
-        "/a.jsonl": { ...encoded.files["/a.jsonl"]!, cs: { model: 42 } },
+        "/a.jsonl": { ...encoded.files["/a.jsonl"]!, r: [[1, 42]] },
       },
     };
 
     expect(decodeScanCache(JSON.parse(JSON.stringify(poisoned))).has("/a.jsonl")).toBe(false);
   });
 
-  it("drops an entry whose guard length is outside the supported range", () => {
-    // The guard length sizes a Buffer in the reader; a bogus value would make
-    // every parse of that file fail and silently drop its usage.
+  it("drops an entry whose persisted Codex state is corrupt", () => {
+    const encoded = encodeScanCache(
+      new Map([
+        [
+          "/codex.jsonl",
+          {
+            size: 10,
+            mtimeMs: 100,
+            provider: "codex",
+            records: [record({ provider: "codex" })],
+            codexState: {
+              model: "gpt-5.2-codex",
+              sessionId: "session-c",
+              lastUsageSignature: null,
+              sawSessionMeta: true,
+              suppressingForkCopies: false,
+              forkCopyAnchorMs: 0,
+            },
+          },
+        ],
+      ]),
+    );
+    const poisoned = {
+      ...encoded,
+      files: { "/codex.jsonl": { ...encoded.files["/codex.jsonl"]!, c: [42] } },
+    };
+    expect(decodeScanCache(JSON.parse(JSON.stringify(poisoned))).has("/codex.jsonl")).toBe(false);
+  });
+
+  it("drops an entry whose compact row contains invalid intern indexes", () => {
     const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]));
     const poisoned = {
       ...encoded,
-      files: { "/a.jsonl": { ...encoded.files["/a.jsonl"]!, gl: 1e20 } },
+      files: {
+        "/a.jsonl": { ...encoded.files["/a.jsonl"]!, r: [[1, 99, 0, 1, 1, 1, 1, 0, null, null]] },
+      },
     };
 
     expect(decodeScanCache(JSON.parse(JSON.stringify(poisoned))).has("/a.jsonl")).toBe(false);
   });
 
-  it("rejects a document from the previous cache version", () => {
+  it("accepts a document from a supported previous cache version", () => {
     const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]));
     const previous = { ...encoded, version: 2 };
 
-    expect(decodeScanCache(JSON.parse(JSON.stringify(previous))).size).toBe(0);
+    expect(decodeScanCache(JSON.parse(JSON.stringify(previous))).size).toBe(1);
   });
 
   it("interns repeated model and session strings", () => {
@@ -137,6 +168,87 @@ describe("scan cache round trip", () => {
 
     expect(encoded.models).toEqual(["claude-fable-5"]);
     expect(encoded.sessions).toEqual(["session-a"]);
+  });
+
+  it("restores provider-root scan coverage", () => {
+    const coverage = [
+      {
+        provider: "codex" as const,
+        rootPath: "/home/me/.codex/sessions",
+        sinceMs: 100,
+        scannedAtMs: 200,
+      },
+    ];
+
+    const encoded = encodeScanCache(new Map(), coverage);
+
+    expect(decodeScanCoverage(JSON.parse(JSON.stringify(encoded)))).toEqual(coverage);
+  });
+
+  it("restores the Codex append parser state", () => {
+    const original = cacheWith([["/codex.jsonl", 100, [record({ provider: "codex" })]]]);
+    const cached = original.get("/codex.jsonl")!;
+    original.set("/codex.jsonl", {
+      ...cached,
+      codexState: {
+        model: "gpt-5.6-sol",
+        sessionId: "session-codex",
+        lastUsageSignature: '{"input_tokens":10}',
+        sawSessionMeta: true,
+        suppressingForkCopies: false,
+        forkCopyAnchorMs: 123,
+      },
+    });
+
+    const restored = decodeScanCache(JSON.parse(JSON.stringify(encodeScanCache(original))));
+
+    expect(restored.get("/codex.jsonl")?.codexState).toEqual(
+      original.get("/codex.jsonl")?.codexState,
+    );
+  });
+
+  it("keeps v2 file entries but treats them as uncovered", () => {
+    const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]));
+    const v2 = { ...encoded, version: 2, coverage: undefined };
+
+    expect(decodeScanCache(JSON.parse(JSON.stringify(v2))).size).toBe(1);
+    expect(decodeScanCoverage(JSON.parse(JSON.stringify(v2)))).toEqual([]);
+  });
+
+  it("keeps v3 coverage while requiring a fresh parser state", () => {
+    const coverage = [
+      { provider: "codex" as const, rootPath: "/sessions", sinceMs: 100, scannedAtMs: 200 },
+    ];
+    const encoded = encodeScanCache(cacheWith([["/a.jsonl", 100, [record()]]]), coverage);
+    const v3 = { ...encoded, version: 3 };
+
+    expect(decodeScanCache(JSON.parse(JSON.stringify(v3))).get("/a.jsonl")?.codexState).toBe(
+      undefined,
+    );
+    expect(decodeScanCoverage(JSON.parse(JSON.stringify(v3)))).toEqual(coverage);
+  });
+
+  it("invalidates old Codex parsing while retaining its coverage", () => {
+    const cache = cacheWith([["/codex.jsonl", 100, [record({ provider: "codex" })]]]);
+    cache.set("/codex.jsonl", { ...cache.get("/codex.jsonl")!, provider: "codex" });
+    cache.set("/ai-studio.json", {
+      size: 10,
+      mtimeMs: 100,
+      provider: "aistudio",
+      records: [record({ provider: "aistudio" })],
+    });
+    const encoded = encodeScanCache(cache, [
+      { provider: "codex", rootPath: "/sessions", sinceMs: 100, scannedAtMs: 200 },
+      { provider: "aistudio", rootPath: "/imports", sinceMs: 100, scannedAtMs: 200 },
+    ]);
+    const v4 = { ...encoded, version: 4 };
+
+    expect([...decodeScanCache(JSON.parse(JSON.stringify(v4))).keys()]).toEqual([
+      "/ai-studio.json",
+    ]);
+    expect(decodeScanCoverage(JSON.parse(JSON.stringify(v4)))).toEqual([
+      { provider: "codex", rootPath: "/sessions", sinceMs: 100, scannedAtMs: 200 },
+    ]);
   });
 
   it("treats a corrupt or foreign document as an empty cache", () => {
@@ -185,6 +297,92 @@ describe("scan cache round trip", () => {
 
     const restored = decodeScanCache(JSON.parse(JSON.stringify(poisoned)));
     expect(restored.has("/a.jsonl")).toBe(false);
+  });
+});
+
+describe("planTranscriptScan", () => {
+  const nowMs = 1_000_000;
+  const common = {
+    windowStartMs: 100_000,
+    nowMs,
+    lastRecentScanAtMs: 0,
+    incrementalScanTtlMs: 15_000,
+    recentTranscriptWindowMs: 200_000,
+    fullScanIntervalMs: 300_000,
+  };
+
+  it("starts with a complete requested-window scan", () => {
+    expect(planTranscriptScan({ ...common, coverage: undefined })).toEqual({
+      hasCurrentCoverage: false,
+      shouldRefresh: true,
+      scanStartMs: common.windowStartMs,
+    });
+  });
+
+  it("refreshes only recent history when a wider persisted scan is fresh", () => {
+    expect(
+      planTranscriptScan({
+        ...common,
+        coverage: {
+          provider: "codex",
+          rootPath: "/sessions",
+          sinceMs: 50_000,
+          scannedAtMs: nowMs - 10_000,
+        },
+      }),
+    ).toEqual({
+      hasCurrentCoverage: true,
+      shouldRefresh: true,
+      scanStartMs: nowMs - common.recentTranscriptWindowMs,
+    });
+  });
+
+  it("reuses the last inventory during rapid range switches", () => {
+    expect(
+      planTranscriptScan({
+        ...common,
+        lastRecentScanAtMs: nowMs - 1000,
+        coverage: {
+          provider: "codex",
+          rootPath: "/sessions",
+          sinceMs: 50_000,
+          scannedAtMs: nowMs - 10_000,
+        },
+      }).shouldRefresh,
+    ).toBe(false);
+  });
+
+  it("audits the full covered range after coverage expires", () => {
+    expect(
+      planTranscriptScan({
+        ...common,
+        coverage: {
+          provider: "codex",
+          rootPath: "/sessions",
+          sinceMs: 50_000,
+          scannedAtMs: nowMs - common.fullScanIntervalMs,
+        },
+      }),
+    ).toEqual({
+      hasCurrentCoverage: false,
+      shouldRefresh: true,
+      scanStartMs: 50_000,
+    });
+  });
+
+  it("widens from the requested start when coverage is too narrow", () => {
+    expect(
+      planTranscriptScan({
+        ...common,
+        windowStartMs: 25_000,
+        coverage: {
+          provider: "codex",
+          rootPath: "/sessions",
+          sinceMs: 50_000,
+          scannedAtMs: nowMs - 10_000,
+        },
+      }).scanStartMs,
+    ).toBe(25_000);
   });
 });
 

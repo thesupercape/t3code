@@ -2,18 +2,53 @@ import {
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
+  type SubagentBackend,
   ProviderDriverKind,
   type ModelCapabilities,
   type ProviderInstanceId,
   type ServerProvider,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import { createModelCapabilities, resolveSelectableModel } from "@t3tools/shared/model";
+import { createModelCapabilities, normalizeModelSlug } from "@t3tools/shared/model";
 
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
 });
 const DEFAULT_DRIVER_KIND = ProviderDriverKind.make("codex");
+export const DEFAULT_CODEX_SUBAGENT_BACKEND: SubagentBackend = "native-v1-control";
+
+export const SUBAGENT_BACKEND_OPTIONS: ReadonlyArray<{
+  readonly value: SubagentBackend;
+  readonly label: string;
+  readonly description: string;
+}> = [
+  {
+    value: "v1",
+    label: "V1",
+    description: "Codex app-server V1 with namespaced multi_agent_v1 tools.",
+  },
+  {
+    value: "v2",
+    label: "V2",
+    description: "Codex app-server V2 with plain sub-agent control tools.",
+  },
+  {
+    value: "native-v1-control",
+    label: "Native V1 control",
+    description: "T3 Workers linked-provider control, separate from Codex V1 and V2.",
+  },
+];
+
+export function resolveComposerSubagentBackend(
+  savedBackend: SubagentBackend | null | undefined,
+  provider: ProviderDriverKind,
+  options?: { readonly workersEnabled?: boolean },
+): SubagentBackend | null {
+  if (provider !== DEFAULT_DRIVER_KIND) return null;
+  if (savedBackend === "native-v1-control" && options?.workersEnabled === false) return null;
+  if (savedBackend !== null && savedBackend !== undefined) return savedBackend;
+  return options?.workersEnabled === true ? DEFAULT_CODEX_SUBAGENT_BACKEND : null;
+}
 
 export function formatProviderDriverKindLabel(provider: ProviderDriverKind): string {
   return provider
@@ -30,12 +65,37 @@ export function getProviderModels(
   return getProviderSnapshot(providers, provider)?.models ?? [];
 }
 
-function getProviderSnapshot(
+export function getProviderSnapshot(
   providers: ReadonlyArray<ServerProvider>,
   provider: ProviderDriverKind,
 ): ServerProvider | undefined {
   const defaultInstanceId = defaultInstanceIdForDriver(provider);
   return providers.find((candidate) => candidate.instanceId === defaultInstanceId);
+}
+
+export function getProviderDisplayName(
+  providers: ReadonlyArray<ServerProvider>,
+  provider: ProviderDriverKind,
+): string {
+  const snapshot = getProviderSnapshot(providers, provider);
+  return snapshot?.displayName?.trim() || formatProviderDriverKindLabel(provider);
+}
+
+export function getProviderInteractionModeToggle(
+  providers: ReadonlyArray<ServerProvider>,
+  provider: ProviderDriverKind,
+): boolean {
+  return getProviderSnapshot(providers, provider)?.showInteractionModeToggle ?? true;
+}
+
+export function isProviderEnabled(
+  providers: ReadonlyArray<ServerProvider>,
+  provider: ProviderDriverKind,
+): boolean {
+  if (providers.length === 0) {
+    return true;
+  }
+  return getProviderSnapshot(providers, provider)?.enabled ?? false;
 }
 
 // Resolve an instance selection to the correlated live driver. If the
@@ -58,9 +118,9 @@ export function getProviderModelCapabilities(
   provider: ProviderDriverKind,
   planModeEnabled = true,
 ): ModelCapabilities {
-  const slug = resolveSelectableModel(provider, model, models);
-  const selectedModel = models.find((candidate) => candidate.slug === slug);
-  const caps = selectedModel?.capabilities ?? EMPTY_CAPABILITIES;
+  const slug = normalizeModelSlug(model, provider);
+  const caps =
+    models.find((candidate) => candidate.slug === slug)?.capabilities ?? EMPTY_CAPABILITIES;
   if (planModeEnabled) {
     return caps;
   }
@@ -90,6 +150,61 @@ function withoutPlanAgentOption(caps: ModelCapabilities): ModelCapabilities {
       return [{ ...descriptor, options, ...(currentValue ? { currentValue } : {}) }];
     }),
   };
+}
+
+export function getSubagentBackendOptions(
+  models: ReadonlyArray<ServerProviderModel>,
+  model: string | null | undefined,
+  provider: ProviderDriverKind,
+  options?: { readonly workersEnabled?: boolean },
+): ReadonlyArray<{
+  readonly value: SubagentBackend;
+  readonly label: string;
+  readonly description: string;
+  readonly supported: boolean;
+  readonly reason: string;
+}> {
+  const capabilities = getProviderModelCapabilities(models, model, provider);
+  return SUBAGENT_BACKEND_OPTIONS.map((option) => {
+    const backendsWithLegacyKey = capabilities.subagentBackends as
+      | (typeof capabilities.subagentBackends & {
+          readonly nativeV1Control?: { readonly supported: boolean; readonly reason?: string };
+        })
+      | undefined;
+    const capability =
+      option.value === "native-v1-control"
+        ? (capabilities.subagentBackends?.["native-v1-control"] ??
+          backendsWithLegacyKey?.nativeV1Control)
+        : capabilities.subagentBackends?.[option.value];
+    const workersDisabled =
+      option.value === "native-v1-control" && options?.workersEnabled === false;
+    return {
+      ...option,
+      supported: capability?.supported === true && !workersDisabled,
+      reason:
+        (workersDisabled
+          ? "T3 Workers are disabled in settings; enable them before selecting Native V1 control."
+          : capability?.reason) ??
+        "This provider/model has not advertised support for this sub-agent backend.",
+    };
+  });
+}
+
+export function getSubagentBackendUnavailableReason(
+  backend: SubagentBackend | null | undefined,
+  models: ReadonlyArray<ServerProviderModel>,
+  model: string | null | undefined,
+  provider: ProviderDriverKind,
+  options?: { readonly workersEnabled?: boolean },
+): string | null {
+  if (backend === null || backend === undefined) return null;
+  const selected = getSubagentBackendOptions(models, model, provider, options).find(
+    (option) => option.value === backend,
+  );
+  return selected?.supported
+    ? null
+    : (selected?.reason ??
+        "The selected model has not advertised support for this sub-agent backend.");
 }
 
 export function getDefaultServerModel(

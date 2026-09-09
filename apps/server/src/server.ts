@@ -1,5 +1,4 @@
 import { EnvironmentHttpApi, ProviderDriverKind } from "@t3tools/contracts";
-import * as Cause from "effect/Cause";
 import * as Duration from "effect/Duration";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -15,7 +14,6 @@ import * as ServerConfig from "./config.ts";
 import {
   otlpTracesProxyRouteLayer,
   assetRouteLayer,
-  attachmentUploadRouteLayer,
   serverEnvironmentHttpApiLayer,
   staticAndDevRouteLayer,
   browserApiCorsLayer,
@@ -36,12 +34,15 @@ import * as ProviderSessionRuntime from "./persistence/ProviderSessionRuntime.ts
 import { ProviderAdapterRegistryLive } from "./provider/Layers/ProviderAdapterRegistry.ts";
 import * as ModelManifest from "./provider/ModelManifest.ts";
 import * as CodexResetCredit from "./provider/Layers/codexResetCredit.ts";
+import { codexDesktopRouteLayer } from "./provider/CodexDesktopHttp.ts";
+import * as CodexDesktopStore from "./provider/CodexDesktopStore.ts";
 import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
 import { ProviderServiceLive } from "./provider/Layers/ProviderService.ts";
 import { ProviderAuthServiceLive } from "./provider/Layers/ProviderAuthService.ts";
 import { AntigravityInstallation } from "./provider/AntigravityInstallation.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { ProviderRegistry } from "./provider/Services/ProviderRegistry.ts";
+import * as ProviderService from "./provider/Services/ProviderService.ts";
 import { ProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper.ts";
 import { ProviderUsageLimitsIngestionLive } from "./provider/Layers/ProviderUsageLimitsIngestion.ts";
 import * as OpenCodeRuntime from "./provider/opencodeRuntime.ts";
@@ -55,13 +56,13 @@ import * as TextGeneration from "./textGeneration/TextGeneration.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+import * as ChromeAutomation from "./browser/ChromeAutomation.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
-import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
@@ -78,6 +79,7 @@ import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
+import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -108,7 +110,6 @@ import {
   releaseManagedTunnelOnShutdown,
 } from "./cloud/http.ts";
 import { serverRelayBrokerTracingLayer } from "./cloud/relayTracing.ts";
-import { shouldRetryCloudLink } from "./cloud/relayResponse.ts";
 import * as CloudManagedEndpointRuntime from "./cloud/ManagedEndpointRuntime.ts";
 import * as CloudCliTokenManager from "./cloud/CliTokenManager.ts";
 import * as CloudCliState from "./cloud/CliState.ts";
@@ -124,8 +125,9 @@ import * as NativeTelemetryClient from "./resourceTelemetry/NativeTelemetryClien
 import * as ResourceAttribution from "./resourceTelemetry/ResourceAttribution.ts";
 import * as ResourceMonitorBinary from "./resourceTelemetry/ResourceMonitorBinary.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
-import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
+import * as UsageResetCheck from "./usage/UsageResetCheck.ts";
+import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import {
   clearPersistedServerRuntimeState,
@@ -137,9 +139,22 @@ import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
 import { forkParked, ServerActivation } from "./serverActivation.ts";
+import { WorkerStoreLive } from "./worker/WorkerStore.ts";
+import { CodexLinkedWorkerBackendLive } from "./worker/WorkerBackend.ts";
+import {
+  WorkerObserverLive,
+  WorkerObserverModelCatalogLive,
+  WorkerObserverRunnerLive,
+} from "./worker/WorkerObserver.ts";
+import { WorkerService, WorkerServiceLive } from "./worker/WorkerService.ts";
+import {
+  createCodexDesktopMailboxLayout,
+  resolveCodexDesktopMailboxRoot,
+  waitForCodexDesktopMailboxChange,
+} from "./worker/CodexDesktopMailbox.ts";
 
-// MCP handoff thread IDs include escaped provenance and can exceed find-my-way's
-// 100-character default for one path segment.
+// MCP handoff thread IDs include escaped provenance and can exceed
+// find-my-way's default path parameter length.
 export const HTTP_ROUTER_CONFIG = {
   maxParamLength: 512,
 } as const;
@@ -178,6 +193,10 @@ const DesktopTelemetryReceiverLayerLive = DesktopTelemetryReceiver.layer.pipe(
   Layer.provideMerge(ServerSettingsLayerLive),
 );
 
+const DesktopAppUpdateLayerLive = DesktopAppUpdate.layer.pipe(
+  Layer.provide(DesktopTelemetryReceiverLayerLive),
+);
+
 const ResourceTelemetryLayerLive = ResourceTelemetry.layer.pipe(
   Layer.provideMerge(NativeTelemetryLayerLive),
   Layer.provideMerge(DesktopTelemetryReceiverLayerLive),
@@ -187,18 +206,16 @@ const HostPowerMonitorLayerLive = HostPowerMonitor.layer.pipe(
   Layer.provide(DesktopTelemetryReceiverLayerLive),
 );
 
-// Reuses DesktopTelemetryReceiverLayerLive: a fresh receiver layer here
-// would open a second reader on the desktop telemetry fd.
-const DesktopAppUpdateLayerLive = DesktopAppUpdate.layer.pipe(
-  Layer.provide(DesktopTelemetryReceiverLayerLive),
-);
-
 const BackgroundLayerLive = BackgroundPolicy.layer.pipe(
   Layer.provide(HostPowerMonitorLayerLive),
   Layer.provideMerge(ServerSettingsLayerLive),
 );
 
-const UsageLayerLive = UsageService.layer.pipe(Layer.provide(ServerSettingsLayerLive));
+const UsageLayerLive = Layer.mergeAll(
+  UsageService.layer,
+  UsageResetCheck.layer,
+  UsageResetCheck.communityLayer,
+).pipe(Layer.provide(ServerSettingsLayerLive));
 
 const ResourceDiagnosticsLayerLive = Layer.mergeAll(
   HostResources.layer,
@@ -318,12 +335,15 @@ const PullRequestServiceLive = PullRequestService.layer.pipe(
   Layer.provide(PullRequestProviderRegistry.layer),
   Layer.provide(SourceControlProviderRegistryLayerLive),
   Layer.provide(SourceControlRateLimit.layer),
+  Layer.provide(VcsProcess.layer),
 );
 
 const GitManagerLayerLive = GitManager.layer.pipe(
-  Layer.provideMerge(ProjectSetupScriptRunner.layer.pipe(Layer.provide(ServerSettingsLayerLive))),
+  Layer.provideMerge(ProjectSetupScriptRunner.layer),
   Layer.provideMerge(GitVcsDriver.layer),
-  Layer.provideMerge(SourceControlProviderRegistryLayerLive),
+  Layer.provideMerge(
+    Layer.mergeAll(SourceControlProviderRegistryLayerLive, PullRequestServiceLive),
+  ),
   Layer.provideMerge(TextGeneration.layer),
 );
 
@@ -419,9 +439,6 @@ const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
 );
 
 const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
-  // Subscribes to `account.rate-limits.updated` so usage bars track live
-  // telemetry instead of waiting for the next status probe.
-  Layer.provideMerge(ProviderUsageLimitsIngestionLive),
   Layer.provideMerge(ProviderLayerLive),
   Layer.provideMerge(OrchestrationLayerLive),
 );
@@ -436,15 +453,13 @@ const AntigravityInstallationRefreshLive = Layer.effectDiscard(
       Stream.changes,
       Stream.drop(1),
       Stream.runForEach(() =>
-        instances.listInstances.pipe(
-          Effect.flatMap((entries) =>
-            Effect.forEach(
-              entries.filter(
-                (instance) => instance.driverKind === ProviderDriverKind.make("antigravity"),
-              ),
-              (instance) => providers.refreshInstance(instance.instanceId),
-              { discard: true },
+        Effect.flatMap(instances.listInstances, (allInstances) =>
+          Effect.forEach(
+            allInstances.filter(
+              (instance) => instance.driverKind === ProviderDriverKind.make("antigravity"),
             ),
+            (instance) => providers.refreshInstance(instance.instanceId),
+            { discard: true },
           ),
         ),
       ),
@@ -453,9 +468,56 @@ const AntigravityInstallationRefreshLive = Layer.effectDiscard(
   }),
 );
 
+const WorkerObserverLayerLive = WorkerObserverLive.pipe(
+  Layer.provide(WorkerObserverModelCatalogLive),
+  Layer.provide(WorkerObserverRunnerLive),
+);
+
+const WorkerServiceLayerLive = WorkerServiceLive.pipe(
+  Layer.provide(WorkerStoreLive),
+  Layer.provide(CodexLinkedWorkerBackendLive),
+  Layer.provide(WorkerObserverLayerLive),
+  // The linked backend and the read-only observer runner both use the same
+  // ProviderService instance as the normal runtime. Providing it here keeps
+  // the Worker layer self-contained and prevents the requirement leaking into
+  // route/test layers that only consume the already-built Worker service.
+  Layer.provideMerge(ProviderLayerLive),
+);
+
+const WorkerRuntimeLayerLive = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const workers = yield* WorkerService;
+    const provider = yield* ProviderService.ProviderService;
+    yield* workers.recover;
+    // Native Codex Desktop has no ProviderService event stream. Reconcile at
+    // startup, then wait on receipt directories with a bounded timeout so a
+    // missed filesystem notification is eventually recovered without a tight
+    // polling loop.
+    yield* Effect.gen(function* () {
+      if (workers.reconcileDesktop === undefined) return;
+      const config = yield* ServerConfig.ServerConfig;
+      const layout = createCodexDesktopMailboxLayout(
+        resolveCodexDesktopMailboxRoot(config.baseDir),
+      );
+      while (true) {
+        yield* workers.reconcileDesktop;
+        yield* Effect.tryPromise(() => waitForCodexDesktopMailboxChange(layout, 30_000)).pipe(
+          Effect.catch(() => Effect.succeed("timeout" as const)),
+        );
+      }
+    }).pipe(Effect.forkScoped);
+    yield* provider.streamEvents.pipe(
+      Stream.runForEach(workers.handleProviderEvent),
+      Effect.forkScoped,
+    );
+  }),
+).pipe(Layer.provideMerge(WorkerServiceLayerLive));
+
 const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(AntigravityInstallationRefreshLive),
-  Layer.provideMerge(ProviderAuthServiceLive),
+  Layer.provideMerge(
+    Layer.mergeAll(BackgroundLayerLive, ProviderAuthServiceLive, ProviderUsageLimitsIngestionLive),
+  ),
   // Core Services
   Layer.provideMerge(ServerSettingsLayerLive),
   Layer.provideMerge(CheckpointingLayerLive),
@@ -465,10 +527,8 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(GitLayerLive),
   Layer.provideMerge(VcsLayerLive),
   Layer.provideMerge(ProviderRuntimeLayerLive),
-  Layer.provideMerge(Layer.mergeAll(TerminalLayerLive, PreviewLayerLive)),
+  Layer.provideMerge(Layer.mergeAll(WorkerRuntimeLayerLive, TerminalLayerLive, PreviewLayerLive)),
   Layer.provideMerge(PersistenceLayerLive),
-  // Both read a user-owned file out of the state directory and stream changes
-  // to clients; neither depends on the other.
   Layer.provideMerge(
     Layer.mergeAll(Keybindings.layer, EnvironmentTheme.layer, UsageLimitSources.layer),
   ),
@@ -479,18 +539,19 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
   Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
-).pipe(
-  Layer.provideMerge(AntigravityInstallation.layer),
   // Shared native/canonical NDJSON writers used by both the per-instance
   // drivers (native stream, written from inside each `<X>Adapter`) and
   // `ProviderService` (canonical stream, written after event normalization).
   // Provided once at the runtime level so every consumer sees the same
-  // logger instances.
-  // `ModelManifest.layer` is the legacy-model classification data, refreshed
-  // from the repo's `model-manifest.json` on `main` and applied by the
-  // Codex/Claude drivers.
+  // logger instances. The Preview broker is shared here too: provider readiness
+  // and both host transports must observe the same connected desktop hosts.
   Layer.provideMerge(
-    Layer.mergeAll(ProviderEventLoggers.layer, ModelManifest.layer, CodexResetCredit.layer),
+    Layer.mergeAll(
+      ProviderEventLoggers.layer,
+      ModelManifest.layer,
+      CodexResetCredit.layer,
+      PreviewAutomationBroker.layer,
+    ),
   ),
   // `OpenCodeDriver.create()` yields `OpenCodeRuntime`; previously the old
   // `ProviderRegistryLive` pulled `OpenCodeRuntimeLive` in for itself, but
@@ -500,12 +561,11 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
   Layer.provideMerge(WorkspaceLayerLive),
   Layer.provideMerge(Layer.mergeAll(NativeAppIconResolver.layer, ProjectFaviconResolverLayerLive)),
-  Layer.provideMerge(RepositoryIdentityResolver.layer),
-  Layer.provideMerge(ServerEnvironmentLayerLive),
+  Layer.provideMerge(Layer.mergeAll(RepositoryIdentityResolver.layer, ServerEnvironmentLayerLive)),
   Layer.provideMerge(AuthLayerLive),
-  Layer.provideMerge(ServerSecretStore.layer),
   Layer.provideMerge(
     Layer.mergeAll(
+      ServerSecretStore.layer,
       CloudCliTokenManager.layer.pipe(
         Layer.provide(ServerSecretStore.layer),
         Layer.provide(ExternalLauncher.layer),
@@ -513,9 +573,9 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
       CloudManagedEndpointRuntimeLive,
     ),
   ),
-);
+).pipe(Layer.provideMerge(AntigravityInstallation.layer));
 
-const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
+export const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
   // Misc.
   Layer.provideMerge(BackgroundLayerLive),
   Layer.provideMerge(ResourceDiagnosticsLayerLive),
@@ -547,8 +607,8 @@ export const makeRoutesLayer = Layer.mergeAll(
       Layer.provide(environmentAuthenticatedAuthLayer),
     ),
     otlpTracesProxyRouteLayer,
+    codexDesktopRouteLayer.pipe(Layer.provide(CodexDesktopStore.layer)),
     assetRouteLayer,
-    attachmentUploadRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
   ),
@@ -557,7 +617,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   // Both transports consume the same service instance, so caches single-flight across clients
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
   Layer.provide(PullRequestServiceLive),
-  Layer.provide(PreviewAutomationBroker.layer),
+  Layer.provide(ChromeAutomation.layer),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(DesktopAppUpdateLayerLive))),
   Layer.provide(commandReadinessLayer),
   Layer.provide(browserApiCorsLayer),
@@ -684,7 +744,7 @@ const makeServerLayer = Layer.unwrap(
           Effect.catchCause((cause) =>
             Effect.logWarning(
               "Failed to release the managed tunnel on shutdown; the next link reuses it",
-              { errors: Cause.prettyErrors(cause).map((error) => error.message) },
+              { cause },
             ),
           ),
           Effect.asVoid,
@@ -716,7 +776,10 @@ const makeServerLayer = Layer.unwrap(
             // reachability after a restart.
             yield* reconcileDesiredCloudLink(`http://127.0.0.1:${address.port}`).pipe(
               Effect.retry({
-                while: shouldRetryCloudLink,
+                while: (error) =>
+                  error._tag !== "EnvironmentHttpBadRequestError" &&
+                  error._tag !== "EnvironmentHttpUnauthorizedError" &&
+                  error._tag !== "EnvironmentHttpConflictError",
                 schedule: Schedule.exponential("1 second").pipe(
                   Schedule.modifyDelay(({ duration }) =>
                     Effect.succeed(Duration.min(duration, Duration.seconds(30))),
@@ -727,7 +790,7 @@ const makeServerLayer = Layer.unwrap(
               Effect.tap(() => Effect.logInfo("T3 Connect desired link reconciled on startup")),
               Effect.catch((cause) =>
                 Effect.logWarning("Failed to reconcile T3 Connect desired link on startup", {
-                  message: cause.message,
+                  cause,
                 }),
               ),
             );
@@ -751,10 +814,19 @@ const makeServerLayer = Layer.unwrap(
       ).pipe(Effect.asVoid),
     }).pipe(Layer.provideMerge(RuntimeDependenciesLive), Layer.provide(launcherLayer));
 
-    const routesLayer = HttpRouter.serve(makeRoutesLayer.pipe(Layer.provide(launcherLayer)), {
-      disableLogger: !config.logWebSocketEvents,
-      routerConfig: HTTP_ROUTER_CONFIG,
-    }).pipe(Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)));
+    const routesLayer = HttpRouter.serve(
+      makeRoutesLayer.pipe(
+        Layer.provide(launcherLayer),
+        // HTTP and WebSocket handlers consume the same runtime services as
+        // the startup reactors. Keep the graph explicit here so those
+        // services are available to the route layer as well.
+        Layer.provide(RuntimeDependenciesLive),
+      ),
+      {
+        disableLogger: !config.logWebSocketEvents,
+        routerConfig: HTTP_ROUTER_CONFIG,
+      },
+    ).pipe(Layer.tap(() => Deferred.succeed(routesReady, undefined).pipe(Effect.orDie)));
     const serverApplicationLayer = Layer.mergeAll(
       routesLayer,
       httpListeningLayer,
@@ -770,8 +842,7 @@ const makeServerLayer = Layer.unwrap(
       Layer.provideMerge(HttpServerLive),
       Layer.provide(ApplicationObservabilityLive),
       Layer.provideMerge(FetchHttpClient.layer),
-      // PR reads, Git operations, and WebSocket discovery share one process limiter.
-      Layer.provide(VcsProcess.layer),
+      Layer.provideMerge(VcsProcess.layer),
       Layer.provideMerge(PlatformServicesLive),
     );
   }),

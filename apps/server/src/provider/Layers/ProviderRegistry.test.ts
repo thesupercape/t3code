@@ -21,6 +21,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
   ProviderInstanceId,
+  EnvironmentId,
   ServerSettings,
   type ServerProvider,
   type ServerProviderSlashCommand,
@@ -36,6 +37,8 @@ import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import { checkCodexProviderStatus, type CodexAppServerProviderSnapshot } from "./CodexProvider.ts";
 import { checkClaudeProviderStatus } from "./ClaudeProvider.ts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { AntigravityInstallation } from "../AntigravityInstallation.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import * as CodexResetCredit from "./codexResetCredit.ts";
@@ -81,6 +84,24 @@ const TestHttpClientLive = Layer.succeed(
   HttpClient.HttpClient,
   HttpClient.make((request) =>
     Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" }))),
+  ),
+);
+
+const ProviderRuntimeContextTestLayers = Layer.mergeAll(
+  Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({
+    isBrowserAvailable: () => Effect.succeed(false),
+    streamBrowserAvailability: () => Stream.empty,
+    connect: () => Effect.die("unused"),
+    focusHost: () => Effect.die("unused"),
+    respond: () => Effect.die("unused"),
+    invoke: () => Effect.die("unused"),
+  }),
+  Layer.succeed(
+    ServerEnvironment.ServerEnvironment,
+    ServerEnvironment.ServerEnvironment.of({
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("test-environment")),
+      getDescriptor: Effect.die("unused"),
+    }),
   ),
 );
 
@@ -2292,6 +2313,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             Layer.provideMerge(CodexResetCredit.layerTest),
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
             Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
+            Layer.provideMerge(ProviderRuntimeContextTestLayers),
             // NO spawner mock — `ChildProcessSpawner` is supplied by the
             // outer `NodeServices.layer` on `it.layer(...)` and will
             // genuinely spawn a subprocess. The missing-binary ENOENT is
@@ -2407,6 +2429,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             ),
             Layer.provideMerge(NodeServices.layer),
             Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
+            Layer.provideMerge(ProviderRuntimeContextTestLayers),
           );
           const runtimeServices = yield* Layer.build(providerRegistryLayer).pipe(
             Scope.provide(scope),
@@ -2510,6 +2533,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
             Layer.provideMerge(NodeServices.layer),
             Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
+            Layer.provideMerge(ProviderRuntimeContextTestLayers),
           );
           const runtimeServices = yield* Layer.build(providerRegistryLayer).pipe(
             Scope.provide(scope),
@@ -2572,6 +2596,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
               Layer.provideMerge(CodexResetCredit.layerTest),
               Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
               Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
+              Layer.provideMerge(ProviderRuntimeContextTestLayers),
               Layer.provideMerge(
                 mockCommandSpawnerLayer((command, args) => {
                   if (command === "cursor-agent") {

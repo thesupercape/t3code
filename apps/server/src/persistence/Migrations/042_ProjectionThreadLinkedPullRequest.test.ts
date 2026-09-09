@@ -8,13 +8,15 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("042_ProjectionThreadLinkedPullRequest", (it) => {
-  it.effect("adds the linked pull request column", () =>
+layer("linked pull request migration compatibility", (it) => {
+  it.effect("adds the linked pull request column through migration 48", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
       yield* runMigrations({ toMigrationInclusive: 41 });
-      yield* runMigrations({ toMigrationInclusive: 42 });
+      // Migration 42 is reserved by AuthSessionClientConnection in the
+      // deployed worker history; migration 48 carries this idempotent repair.
+      yield* runMigrations({ toMigrationInclusive: 48 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_threads)

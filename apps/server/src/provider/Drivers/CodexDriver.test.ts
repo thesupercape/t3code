@@ -3,7 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { expect, it } from "@effect/vitest";
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { EnvironmentId, ProviderInstanceId } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -16,6 +16,8 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { layerTest as codexResetCreditLayerTest } from "../Layers/codexResetCredit.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
@@ -40,6 +42,25 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
     }),
   ),
   Layer.provideMerge(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
+  Layer.provideMerge(
+    Layer.succeed(
+      ServerEnvironment.ServerEnvironment,
+      ServerEnvironment.ServerEnvironment.of({
+        getEnvironmentId: Effect.succeed(EnvironmentId.make("test-environment")),
+        getDescriptor: Effect.die("unused descriptor"),
+      }),
+    ),
+  ),
+  Layer.provideMerge(
+    Layer.mock(PreviewAutomationBroker.PreviewAutomationBroker)({
+      isBrowserAvailable: () => Effect.succeed(false),
+      streamBrowserAvailability: () => Stream.empty,
+      connect: () => Effect.die("unused connect"),
+      focusHost: () => Effect.die("unused focus"),
+      respond: () => Effect.die("unused respond"),
+      invoke: () => Effect.die("unused invoke"),
+    }),
+  ),
   Layer.provideMerge(
     Layer.succeed(
       HttpClient.HttpClient,
@@ -107,7 +128,9 @@ it.layer(testLayer)("CodexDriver", (it) => {
           binaryPath: NodePath.join(NodeOS.tmpdir(), "t3-codex-missing", "codex"),
         },
       });
-      expect((yield* instance.snapshot.resolveMaintenance()).update).toBeNull();
+      const maintenanceEffect = instance.snapshot.resolveMaintenance();
+      const maintenance = yield* maintenanceEffect;
+      expect(maintenance.update).toBeNull();
     }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn), Effect.scoped),
   );
 

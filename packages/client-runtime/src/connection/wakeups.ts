@@ -3,6 +3,7 @@ import * as Layer from "effect/Layer";
 import type * as Stream from "effect/Stream";
 
 export type ConnectionWakeup =
+  | "application-bootstrap-retry"
   | "application-active"
   | "application-active-probe"
   | "application-active-reconnect"
@@ -16,8 +17,16 @@ export function isApplicationActiveWakeup(reason: ConnectionWakeup): boolean {
   );
 }
 
+export function isApplicationRecoveryWakeup(reason: ConnectionWakeup): boolean {
+  return reason === "application-bootstrap-retry" || isApplicationActiveWakeup(reason);
+}
+
 export function shouldResubscribeAfterWakeup(reason: ConnectionWakeup): boolean {
-  return reason === "application-active" || reason === "application-active-probe";
+  return (
+    reason === "application-bootstrap-retry" ||
+    reason === "application-active" ||
+    reason === "application-active-probe"
+  );
 }
 
 export class ConnectionWakeups extends Context.Service<

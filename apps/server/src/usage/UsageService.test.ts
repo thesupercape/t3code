@@ -37,6 +37,37 @@ function claudeLine(id: number, outputTokens: number, model = "claude-fable-5"):
   })}\n`;
 }
 
+function codexTranscript(sessionId: string, outputTokens: number): string {
+  return [
+    JSON.stringify({
+      type: "session_meta",
+      timestamp: "2026-08-01T10:00:00Z",
+      payload: { type: "session_meta", id: sessionId },
+    }),
+    JSON.stringify({
+      type: "turn_context",
+      timestamp: "2026-08-01T10:00:01Z",
+      payload: { type: "turn_context", model: "gpt-5.6-sol" },
+    }),
+    JSON.stringify({
+      type: "event_msg",
+      timestamp: "2026-08-01T10:00:02Z",
+      payload: {
+        type: "token_count",
+        info: {
+          last_token_usage: {
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            cache_write_input_tokens: 0,
+            output_tokens: outputTokens,
+            reasoning_output_tokens: 0,
+          },
+        },
+      },
+    }),
+  ].join("\n");
+}
+
 const WINDOW: UsageSummaryInput = {
   timeZone: "UTC",
   sinceDay: UsageDay.make("2026-07-31"),
@@ -98,6 +129,50 @@ function totalOutputTokens(summary: { buckets: readonly { totals: { outputTokens
 }
 
 describe("UsageService", () => {
+  it.live("counts a migrated rollout once across shared and isolated homes", () =>
+    Effect.gen(function* () {
+      const { settings, home } = yield* setup;
+      yield* Effect.gen(function* () {
+        const serverConfig = yield* ServerConfig.ServerConfig;
+        const sharedFile = NodePath.join(
+          home,
+          "codex",
+          "sessions",
+          "2026",
+          "08",
+          "rollout-2026-08-01T10-00-00-019e487f-1234-7abc-8def-0123456789ab.jsonl",
+        );
+        const isolatedFile = NodePath.join(
+          serverConfig.baseDir,
+          "codex-home",
+          "codex",
+          "sessions",
+          "2026",
+          "08",
+          "rollout-2026-08-01T10-00-00-019e487f-1234-7abc-8def-0123456789ab.jsonl",
+        );
+        const contents = codexTranscript("019e487f-1234-7abc-8def-0123456789ab", 10);
+        yield* Effect.promise(() =>
+          NodeFSP.mkdir(NodePath.dirname(sharedFile), { recursive: true }),
+        );
+        yield* Effect.promise(() =>
+          NodeFSP.mkdir(NodePath.dirname(isolatedFile), { recursive: true }),
+        );
+        yield* Effect.promise(() => NodeFSP.writeFile(sharedFile, contents));
+        yield* Effect.promise(() => NodeFSP.writeFile(isolatedFile, contents));
+
+        const service = yield* UsageService.make;
+        const summary = yield* service.readSummary(WINDOW);
+        assert.strictEqual(totalOutputTokens(summary), 10);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          serviceLayers({ prefix: "usage-service-codex-isolation-test", home, settings }),
+        ),
+      );
+    }).pipe(Effect.scoped),
+  );
+
   it.live("reprices unchanged transcripts when custom prices are added, edited, or removed", () =>
     Effect.gen(function* () {
       const { transcript, settings, home } = yield* setup;
@@ -134,6 +209,7 @@ describe("UsageService", () => {
         const restored = yield* service.readSummary(WINDOW);
         assert.deepStrictEqual(restored.buckets, original.buckets);
       }).pipe(
+        Effect.scoped,
         Effect.provide(
           serviceLayers({ prefix: "usage-service-price-overrides-test", home, settings }),
         ),
@@ -213,6 +289,7 @@ describe("UsageService", () => {
         assert.strictEqual(original.buckets[0]?.costUsd, 0);
         assert.closeTo(updated.buckets[0]?.costUsd ?? -1, 0.00006, 1e-12);
       }).pipe(
+        Effect.scoped,
         Effect.provide(serviceLayers({ prefix: "usage-service-price-race-test", home, settings })),
       );
     }).pipe(Effect.scoped),

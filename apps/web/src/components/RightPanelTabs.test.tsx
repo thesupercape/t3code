@@ -4,19 +4,11 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   RightPanelTabs,
-  shouldOpenDefaultBrowserProfileFromMenuClick,
   surfaceShortcutActionForKey,
   surfaceShortcutTargetsTypingContext,
   tabMuteMenuItem,
 } from "./RightPanelTabs";
-
-describe("browser profile submenu", () => {
-  it("reserves touch clicks for opening the choices while mouse clicks use the default", () => {
-    expect(shouldOpenDefaultBrowserProfileFromMenuClick("touch")).toBe(false);
-    expect(shouldOpenDefaultBrowserProfileFromMenuClick("mouse")).toBe(true);
-    expect(shouldOpenDefaultBrowserProfileFromMenuClick(undefined)).toBe(true);
-  });
-});
+import rightPanelTabsSource from "./RightPanelTabs.tsx?raw";
 
 function shortcutEvent(
   key: string,
@@ -97,7 +89,6 @@ function renderTabs(
     <RightPanelTabs
       mode="inline"
       surfaces={second ? [previewSurface, secondSurface] : [previewSurface]}
-      environmentId={null}
       activeSurfaceId={previewSurface.id}
       pendingSurfaceIds={new Set()}
       previewSessions={sessions}
@@ -114,7 +105,6 @@ function renderTabs(
       onCloseAllSurfaces={() => undefined}
       onCopyFilePath={() => undefined}
       onAddBrowser={() => undefined}
-      onAddBrowserInProfile={() => undefined}
       onAddTerminal={() => undefined}
       onAddPullRequest={() => undefined}
       onAddDiff={() => undefined}
@@ -132,6 +122,59 @@ function renderTabs(
     </RightPanelTabs>,
   );
 }
+
+const workerSurface = { id: "workers", kind: "workers" } as const;
+
+function renderWorkerSurface(workersAvailable: boolean) {
+  return renderToStaticMarkup(
+    <RightPanelTabs
+      mode="inline"
+      surfaces={[workerSurface]}
+      activeSurfaceId={workerSurface.id}
+      pendingSurfaceIds={new Set()}
+      previewSessions={{}}
+      desktopByTabId={{}}
+      terminalLabelsById={new Map()}
+      onActivate={() => undefined}
+      onCloseSurface={() => undefined}
+      onCloseOtherSurfaces={() => undefined}
+      onCloseSurfacesToRight={() => undefined}
+      onCloseAllSurfaces={() => undefined}
+      onCopyFilePath={() => undefined}
+      onAddBrowser={() => undefined}
+      onAddTerminal={() => undefined}
+      onAddPullRequest={() => undefined}
+      onAddDiff={() => undefined}
+      onAddFiles={() => undefined}
+      onAddAgents={() => undefined}
+      onAddWorkers={() => undefined}
+      liveAgentCount={0}
+      browserAvailable
+      terminalAvailable={false}
+      diffAvailable={false}
+      filesAvailable={false}
+      pullRequestAvailable={false}
+      agentsAvailable={false}
+      workersAvailable={workersAvailable}
+    >
+      <div>worker content</div>
+    </RightPanelTabs>,
+  );
+}
+
+describe("RightPanelTabs Worker availability", () => {
+  it("does not render a persisted Worker surface while the feature is disabled", () => {
+    const html = renderWorkerSurface(false);
+    expect(html).toContain("Enable T3 Workers in Settings.");
+    expect(html).not.toContain("worker content");
+  });
+
+  it("renders the Worker surface when enabled", () => {
+    expect(renderWorkerSurface(true)).toContain("worker content");
+    expect(rightPanelTabsSource).toContain("Inspect parent-created T3 Worker activity.");
+    expect(rightPanelTabsSource).not.toContain("Manage persistent T3 workers.");
+  });
+});
 
 describe("RightPanelTabs preview favicon", () => {
   it("prefers a live capture and never asks Google about a private hostname", () => {

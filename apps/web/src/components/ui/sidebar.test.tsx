@@ -8,6 +8,7 @@ import {
   SidebarTrigger,
 } from "./sidebar";
 import { resolveSidebarState } from "./sidebarState";
+import sidebarSource from "./sidebar.tsx?raw";
 
 function renderSidebarButton(className?: string) {
   return renderToStaticMarkup(
@@ -26,6 +27,16 @@ describe("sidebar interactive cursors", () => {
     expect(resolveSidebarState({ isMobile: false, open: true, openMobile: false })).toBe(
       "expanded",
     );
+  });
+
+  it("keeps the mobile sheet mounted so its scroll viewport survives closing", () => {
+    const mobileSidebar = sidebarSource.slice(
+      sidebarSource.indexOf("if (isMobile)"),
+      sidebarSource.indexOf("if (isMobile)") + 2_500,
+    );
+
+    expect(mobileSidebar).toContain("<SheetPopup");
+    expect(mobileSidebar).toContain("keepMounted");
   });
 
   it("exposes collapsed state for shared titlebar inset styling", () => {

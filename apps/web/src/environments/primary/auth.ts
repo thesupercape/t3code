@@ -38,7 +38,7 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedError<PrimaryEn
   "PrimaryEnvironmentRequestError",
   {
     operation: PrimaryEnvironmentRequestOperation,
-    status: Schema.Number,
+    status: Schema.NullOr(Schema.Number),
     pairingLinkId: Schema.optional(Schema.String),
     sessionId: Schema.optional(Schema.String),
     cause: Schema.Defect(),
@@ -50,7 +50,7 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedError<PrimaryEn
     readonly pairingLinkId?: string;
     readonly sessionId?: string;
   }): PrimaryEnvironmentRequestError {
-    const status = readHttpApiStatus(input.cause) ?? 500;
+    const status = readHttpApiStatus(input.cause);
     return new PrimaryEnvironmentRequestError({
       operation: input.operation,
       status,
@@ -61,7 +61,9 @@ export class PrimaryEnvironmentRequestError extends Schema.TaggedError<PrimaryEn
   }
 
   override get message(): string {
-    return `Primary environment request failed during ${this.operation} (HTTP ${this.status}).`;
+    return this.status === null
+      ? `Primary environment request failed during ${this.operation} because the environment transport was unavailable.`
+      : `Primary environment request failed during ${this.operation} (HTTP ${this.status}).`;
   }
 }
 
@@ -266,7 +268,7 @@ async function waitForAuthenticatedSessionAfterBootstrap(): Promise<AuthSessionS
   }
 }
 
-const TRANSIENT_BOOTSTRAP_STATUS_CODES = new Set([502, 503, 504]);
+const TRANSIENT_BOOTSTRAP_STATUS_CODES = new Set([500, 502, 503, 504]);
 const BOOTSTRAP_RETRY_TIMEOUT_MS = 15_000;
 const BOOTSTRAP_RETRY_STEP_MS = 500;
 
@@ -297,7 +299,7 @@ function waitForBootstrapRetry(delayMs: number): Promise<void> {
 
 function isTransientBootstrapError(error: unknown): boolean {
   if (isPrimaryEnvironmentRequestError(error)) {
-    return TRANSIENT_BOOTSTRAP_STATUS_CODES.has(error.status);
+    return error.status === null || TRANSIENT_BOOTSTRAP_STATUS_CODES.has(error.status);
   }
 
   if (error instanceof TypeError) {
@@ -452,7 +454,17 @@ export async function resolveInitialServerAuthGateState(): Promise<ServerAuthGat
     });
 }
 
-export function __resetServerAuthBootstrapForTests() {
+/** Clear a cached success or failure before an explicit reconnect attempt. */
+export function resetServerAuthBootstrap(): void {
   bootstrapPromise = null;
   resolvedAuthenticatedGateState = null;
+}
+
+export function retryInitialServerAuthGateState(): Promise<ServerAuthGateState> {
+  resetServerAuthBootstrap();
+  return resolveInitialServerAuthGateState();
+}
+
+export function __resetServerAuthBootstrapForTests() {
+  resetServerAuthBootstrap();
 }

@@ -1,12 +1,13 @@
 /**
  * Pure parsers for the provider CLIs' on-disk session transcripts.
  *
- * Each parser is a line-at-a-time reducer so callers can stream large files
- * without materialising them. None of them touch the filesystem.
+ * Provider parsers are line-at-a-time reducers where their formats allow it, so callers can stream large files
+ * without materialising them. Neither touches the filesystem.
  *
  * @module usageTranscripts
  */
 import type { UsageProviderKind, UsageTokenTotals } from "@t3tools/contracts";
+import { normalizeServiceTier } from "./codexServiceTier.ts";
 
 export interface UsageRecord {
   readonly provider: UsageProviderKind;
@@ -15,6 +16,9 @@ export interface UsageRecord {
   readonly sessionId: string;
   readonly totals: UsageTokenTotals;
   readonly reportedCostUsd: number | null;
+  readonly serviceTier?: string;
+  readonly serviceTierSource?: "transcript" | "t3Request" | "userReported";
+  readonly turnId?: string;
   /**
    * Key for cross-file de-duplication, or `null` when the record is inherently
    * unique and needs no dedup.
@@ -69,7 +73,7 @@ export function totalTokens(totals: UsageTokenTotals): number {
  */
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
   if (provider === "claude") return line.includes('"usage"');
-  if (provider === "grok") return line.includes('"turn_completed"');
+  if (provider === "gemini") return line.includes('"tokens"');
   return line.includes('"token_count"');
 }
 
@@ -83,7 +87,6 @@ function grokCostTicksToUsd(ticks: unknown): number | null {
   if (typeof ticks !== "number" || !Number.isFinite(ticks) || ticks < 0) return null;
   return ticks / GROK_COST_USD_TICKS_PER_DOLLAR;
 }
-
 /* -------------------------------------------------------------------------- */
 /* Claude Code                                                                */
 /* -------------------------------------------------------------------------- */
@@ -150,6 +153,178 @@ export function parseClaudeLine(line: string): UsageRecord | null {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Gemini CLI                                                                 */
+/* -------------------------------------------------------------------------- */
+
+export interface GeminiScanState {
+  sessionId: string;
+}
+
+export function initialGeminiScanState(): GeminiScanState {
+  return { sessionId: "" };
+}
+
+/**
+ * Parses Gemini CLI's session metadata and standalone message records.
+ *
+ * Newer sessions are JSONL streams, while older sessions store the same
+ * message shape in one JSON document. The caller feeds either representation
+ * through this function and keeps the last record for each message id.
+ */
+export function parseGeminiValue(parsed: unknown, state: GeminiScanState): UsageRecord | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Record<string, unknown>;
+
+  if (typeof record["sessionId"] === "string") state.sessionId = record["sessionId"];
+  if (record["type"] !== "gemini") return null;
+
+  const timestampMs = parseTimestampMs(record["timestamp"]);
+  const model = typeof record["model"] === "string" ? record["model"] : "";
+  const usage = record["tokens"];
+  if (timestampMs === null || model.length === 0 || typeof usage !== "object" || usage === null) {
+    return null;
+  }
+  const usageRecord = usage as Record<string, unknown>;
+  const inputTokens = int(usageRecord["input"]);
+  const cachedInputTokens = Math.min(inputTokens, int(usageRecord["cached"]));
+  const thoughtTokens = int(usageRecord["thoughts"]);
+  const candidateTokens = int(usageRecord["output"]);
+  const toolTokens = int(usageRecord["tool"]);
+  const totals: UsageTokenTotals = {
+    // Gemini reports cached content as a subset of prompt tokens. Tool-use
+    // prompt tokens are a separate input category and are billed as input.
+    uncachedInputTokens: Math.max(0, inputTokens - cachedInputTokens) + toolTokens,
+    cachedInputTokens,
+    cacheCreationTokens: 0,
+    // Thoughts are billed output and included in totalTokenCount separately
+    // from candidate output, so fold them into output while retaining the mix.
+    outputTokens: candidateTokens + thoughtTokens,
+    reasoningTokens: thoughtTokens,
+  };
+  if (totalTokens(totals) === 0) return null;
+
+  const messageId = typeof record["id"] === "string" ? record["id"] : null;
+  return {
+    provider: "gemini",
+    timestampMs,
+    model,
+    sessionId: state.sessionId,
+    totals,
+    reportedCostUsd: null,
+    dedupeKey:
+      messageId === null
+        ? null
+        : `gemini:${state.sessionId.length > 0 ? state.sessionId : "?"}:${messageId}`,
+  };
+}
+
+export function parseGeminiLine(line: string, state: GeminiScanState): UsageRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  return parseGeminiValue(parsed, state);
+}
+
+/** One Antigravity conversation-level token cache. */
+export function parseAntigravityTokenCache(
+  parsed: unknown,
+  input: { readonly timestampMs: number; readonly sessionId: string },
+): UsageRecord | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const usage = parsed as Record<string, unknown>;
+  const inputTokens = int(usage["input"]);
+  const cachedInputTokens = Math.min(inputTokens, int(usage["cached"]));
+  const outputTokens = int(usage["output"]);
+  const totals: UsageTokenTotals = {
+    uncachedInputTokens: Math.max(0, inputTokens - cachedInputTokens),
+    cachedInputTokens,
+    cacheCreationTokens: 0,
+    outputTokens,
+    reasoningTokens: 0,
+  };
+  if (totalTokens(totals) === 0) return null;
+  return {
+    provider: "gemini",
+    timestampMs: input.timestampMs,
+    model: "gemini-antigravity",
+    sessionId: input.sessionId,
+    totals,
+    // Antigravity's local cache reports subscription cost as zero. Usage uses
+    // API-equivalent pricing, so leave this null for the normal rate lookup.
+    reportedCostUsd: null,
+    dedupeKey: `gemini-antigravity:${input.sessionId}`,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* OpenCode                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Parses one OpenCode assistant message from its SQLite session store.
+ *
+ * OpenCode 1.x stores fresh input, cache reads, cache writes, visible output,
+ * and reasoning as disjoint counters. Its own `opencode stats` command adds
+ * reasoning to output when computing the total, so we do the same while
+ * retaining reasoning as the output subset expected by the usage contract.
+ * The recorded cost is authoritative: it includes OpenCode's provider/model
+ * pricing configuration, including explicit zero-cost local and free models.
+ */
+export function parseOpenCodeMessageValue(
+  parsed: unknown,
+  input: {
+    readonly id: string;
+    readonly sessionId: string;
+    readonly timestampMs: number;
+  },
+): UsageRecord | null {
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const message = parsed as Record<string, unknown>;
+  if (message["role"] !== "assistant") return null;
+
+  const providerId = typeof message["providerID"] === "string" ? message["providerID"] : "";
+  const modelId = typeof message["modelID"] === "string" ? message["modelID"] : "";
+  const tokens = message["tokens"];
+  if (
+    providerId.length === 0 ||
+    modelId.length === 0 ||
+    typeof tokens !== "object" ||
+    tokens === null ||
+    !Number.isFinite(input.timestampMs)
+  ) {
+    return null;
+  }
+
+  const tokenRecord = tokens as Record<string, unknown>;
+  const cache = tokenRecord["cache"];
+  const cacheRecord =
+    typeof cache === "object" && cache !== null ? (cache as Record<string, unknown>) : {};
+  const reasoningTokens = int(tokenRecord["reasoning"]);
+  const totals: UsageTokenTotals = {
+    uncachedInputTokens: int(tokenRecord["input"]),
+    cachedInputTokens: int(cacheRecord["read"]),
+    cacheCreationTokens: int(cacheRecord["write"]),
+    outputTokens: int(tokenRecord["output"]) + reasoningTokens,
+    reasoningTokens,
+  };
+  if (totalTokens(totals) === 0) return null;
+
+  const cost = message["cost"];
+  return {
+    provider: "opencode",
+    timestampMs: input.timestampMs,
+    model: `${providerId}/${modelId}`,
+    sessionId: input.sessionId,
+    totals,
+    reportedCostUsd: typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : null,
+    dedupeKey: input.id.length > 0 ? `opencode:${input.id}` : null,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Codex                                                                      */
 /* -------------------------------------------------------------------------- */
 
@@ -162,6 +337,8 @@ export function parseClaudeLine(line: string): UsageRecord | null {
  */
 export interface CodexScanState {
   model: string;
+  serviceTier?: string | undefined;
+  turnId?: string | undefined;
   sessionId: string;
   lastUsageSignature: string | null;
   sawSessionMeta: boolean;
@@ -243,6 +420,11 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
 
   if (record["type"] === "turn_context") {
     if (typeof payloadRecord["model"] === "string") state.model = payloadRecord["model"];
+    state.serviceTier = normalizeServiceTier(
+      payloadRecord["service_tier"] ?? payloadRecord["serviceTier"],
+    );
+    state.turnId =
+      typeof payloadRecord["turn_id"] === "string" ? payloadRecord["turn_id"] : undefined;
     return null;
   }
 
@@ -296,193 +478,26 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
 
   if (totalTokens(totals) === 0) return null;
 
+  const tier =
+    normalizeServiceTier(
+      (info as Record<string, unknown>)["service_tier"] ?? payloadRecord["service_tier"],
+    ) ?? state.serviceTier;
   return {
     provider: "codex",
     timestampMs,
     model: state.model,
+    ...(state.turnId === undefined ? {} : { turnId: state.turnId }),
+    ...(tier === undefined ? {} : { serviceTier: tier, serviceTierSource: "transcript" as const }),
     sessionId: state.sessionId,
     totals,
     // Codex does not report cost in the rollout.
     reportedCostUsd: null,
-    // Events surviving the fork-copy suppression above are unique to this
-    // rollout, so they need no global dedup.
-    dedupeKey: null,
+    // The same rollout may temporarily exist in the legacy shared home and a
+    // T3-owned home during resume migration. Keep a stable cross-file key so
+    // usage counts that copied event once while preserving distinct turns.
+    dedupeKey:
+      state.sessionId.length > 0 ? `codex:${state.sessionId}:${timestampMs}:${signature}` : null,
   };
-}
-
-/* -------------------------------------------------------------------------- */
-/* Grok Build                                                                 */
-/* -------------------------------------------------------------------------- */
-
-interface GrokUsageTotals {
-  readonly inputTokens: number;
-  readonly outputTokens: number;
-  readonly cachedReadTokens: number;
-  readonly cacheCreationTokens: number;
-  readonly reasoningTokens: number;
-  readonly costUsdTicks: number | null;
-}
-
-function readGrokUsageTotals(value: unknown): GrokUsageTotals | null {
-  if (typeof value !== "object" || value === null) return null;
-  const record = value as Record<string, unknown>;
-  return {
-    inputTokens: int(record["inputTokens"]),
-    outputTokens: int(record["outputTokens"]),
-    cachedReadTokens: int(record["cachedReadTokens"]),
-    cacheCreationTokens: int(record["cacheCreationTokens"]),
-    reasoningTokens: int(record["reasoningTokens"]),
-    costUsdTicks:
-      typeof record["costUsdTicks"] === "number" && Number.isFinite(record["costUsdTicks"])
-        ? record["costUsdTicks"]
-        : null,
-  };
-}
-
-function grokTotalsToUsage(totals: GrokUsageTotals): UsageTokenTotals {
-  const cachedInputTokens = totals.cachedReadTokens;
-  const cacheCreationTokens = totals.cacheCreationTokens;
-  // Grok reports `inputTokens` inclusive of the cached portion, matching Codex.
-  const uncachedInputTokens = Math.max(
-    0,
-    totals.inputTokens - cachedInputTokens - cacheCreationTokens,
-  );
-  const outputTokens = totals.outputTokens;
-  return {
-    uncachedInputTokens,
-    cachedInputTokens,
-    cacheCreationTokens,
-    outputTokens,
-    reasoningTokens: Math.min(outputTokens, totals.reasoningTokens),
-  };
-}
-
-/**
- * Parses one line of a Grok Build `updates.jsonl` session log.
- *
- * Usage lands on `turn_completed` session updates. Per-model breakdowns live
- * under `usage.modelUsage`; when present each model becomes its own record.
- *
- * Returns every record for the line (0 or more). Callers stream line-by-line
- * and flatten.
- */
-export function parseGrokLine(line: string): readonly UsageRecord[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return [];
-  }
-  if (typeof parsed !== "object" || parsed === null) return [];
-
-  const record = parsed as Record<string, unknown>;
-  const params = record["params"];
-  if (typeof params !== "object" || params === null) return [];
-  const paramsRecord = params as Record<string, unknown>;
-
-  const update = paramsRecord["update"];
-  if (typeof update !== "object" || update === null) return [];
-  const updateRecord = update as Record<string, unknown>;
-  if (updateRecord["sessionUpdate"] !== "turn_completed") return [];
-
-  const usage = updateRecord["usage"];
-  if (typeof usage !== "object" || usage === null) return [];
-  const usageRecord = usage as Record<string, unknown>;
-
-  const sessionId = typeof paramsRecord["sessionId"] === "string" ? paramsRecord["sessionId"] : "";
-  const promptId = typeof updateRecord["prompt_id"] === "string" ? updateRecord["prompt_id"] : null;
-
-  // Prefer the high-resolution agent clock; fall back to the outer unix seconds.
-  const meta = paramsRecord["_meta"];
-  let timestampMs: number | null = null;
-  if (typeof meta === "object" && meta !== null) {
-    const agentTimestampMs = (meta as Record<string, unknown>)["agentTimestampMs"];
-    if (typeof agentTimestampMs === "number" && Number.isFinite(agentTimestampMs)) {
-      timestampMs = agentTimestampMs;
-    }
-  }
-  if (timestampMs === null) {
-    const timestamp = record["timestamp"];
-    if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
-      timestampMs = timestamp > 1e12 ? timestamp : timestamp * 1000;
-    }
-  }
-  if (timestampMs === null) return [];
-
-  const topLevel = readGrokUsageTotals(usageRecord);
-  if (topLevel === null) return [];
-
-  const modelUsage = usageRecord["modelUsage"];
-  const modelEntries: Array<{ model: string; totals: GrokUsageTotals }> = [];
-  if (typeof modelUsage === "object" && modelUsage !== null) {
-    for (const [model, raw] of Object.entries(modelUsage as Record<string, unknown>)) {
-      if (model.length === 0) continue;
-      const totals = readGrokUsageTotals(raw);
-      if (totals === null) continue;
-      modelEntries.push({ model, totals });
-    }
-  }
-
-  if (modelEntries.length === 0) {
-    if (totalTokens(grokTotalsToUsage(topLevel)) === 0) return [];
-    return [
-      {
-        provider: "grok",
-        timestampMs,
-        model: "grok",
-        sessionId,
-        totals: grokTotalsToUsage(topLevel),
-        reportedCostUsd: grokCostTicksToUsd(topLevel.costUsdTicks),
-        // No prompt id means we cannot tell two same-second updates apart.
-        dedupeKey: promptId === null ? null : `${sessionId}:${promptId}:grok`,
-      },
-    ];
-  }
-
-  // Cost allocation:
-  // 1. Emitted models with their own costUsdTicks keep those values.
-  // 2. Remaining aggregate cost (top-level minus those per-model ticks,
-  //    clamped at 0) is pro-rated across emitted models that lack ticks,
-  //    by token share among the unticked models only.
-  // 3. When no model has per-model ticks, remaining equals the full
-  //    aggregate and every emitted model gets a token-share slice.
-  // Zero-token rows are never emitted and never count toward used ticks.
-  const topLevelCostUsd = grokCostTicksToUsd(topLevel.costUsdTicks);
-  let usedTickedCostUsd = 0;
-  let untickedTokenDenominator = 0;
-  for (const entry of modelEntries) {
-    const tokens = totalTokens(grokTotalsToUsage(entry.totals));
-    if (tokens === 0) continue;
-    if (entry.totals.costUsdTicks !== null) {
-      usedTickedCostUsd += grokCostTicksToUsd(entry.totals.costUsdTicks) ?? 0;
-    } else {
-      untickedTokenDenominator += tokens;
-    }
-  }
-  const remainingCostUsd =
-    topLevelCostUsd === null ? null : Math.max(0, topLevelCostUsd - usedTickedCostUsd);
-
-  const results: UsageRecord[] = [];
-  for (const entry of modelEntries) {
-    const totals = grokTotalsToUsage(entry.totals);
-    if (totalTokens(totals) === 0) continue;
-
-    let reportedCostUsd = grokCostTicksToUsd(entry.totals.costUsdTicks);
-    if (reportedCostUsd === null && remainingCostUsd !== null && untickedTokenDenominator > 0) {
-      reportedCostUsd = remainingCostUsd * (totalTokens(totals) / untickedTokenDenominator);
-    }
-
-    results.push({
-      provider: "grok",
-      timestampMs,
-      model: entry.model,
-      sessionId,
-      totals,
-      reportedCostUsd,
-      dedupeKey: promptId === null ? null : `${sessionId}:${promptId}:${entry.model}`,
-    });
-  }
-  return results;
 }
 
 export { EMPTY_TOTALS };

@@ -11,6 +11,8 @@ export {
   peekPairingTokenFromUrl,
   PrimaryEnvironmentPairingCredentialRejectedError,
   PrimaryEnvironmentRequestError,
+  resetServerAuthBootstrap,
+  retryInitialServerAuthGateState,
   resolveInitialServerAuthGateState,
   revokeOtherServerClientSessions,
   revokeServerClientSession,

@@ -17,6 +17,7 @@ import {
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Context from "effect/Context";
+import * as EffectRuntime from "effect/Effect";
 import type * as Effect from "effect/Effect";
 
 import type { ProjectionRepositoryError } from "../Errors.ts";
@@ -27,10 +28,14 @@ export const ProjectionProject = Schema.Struct({
   workspaceRoot: Schema.String,
   defaultModelSelection: Schema.NullOr(ModelSelection),
   defaultThreadEnvMode: Schema.NullOr(ThreadEnvMode),
-  autoPull: Schema.Boolean,
-  faviconPath: Schema.optional(Schema.NullOr(Schema.String)),
-  projectIcon: Schema.optional(Schema.NullOr(ProjectIconOverride)),
-  scripts: Schema.Array(ProjectScript),
+  autoPull: Schema.Boolean.pipe(Schema.withDecodingDefault(EffectRuntime.succeed(false))),
+  faviconPath: Schema.optional(Schema.NullOr(Schema.String)).pipe(
+    Schema.withDecodingDefault(EffectRuntime.succeed(null)),
+  ),
+  projectIcon: Schema.optional(Schema.NullOr(ProjectIconOverride)).pipe(
+    Schema.withDecodingDefault(EffectRuntime.succeed(null)),
+  ),
+  scripts: Schema.Array(ProjectScript).pipe(Schema.withDecodingDefault(EffectRuntime.succeed([]))),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   deletedAt: Schema.NullOr(IsoDateTime),

@@ -1788,7 +1788,7 @@ export default function GitActionsControl({
             <DialogTitle>{COMMIT_DIALOG_TITLE}</DialogTitle>
             <DialogDescription>{COMMIT_DIALOG_DESCRIPTION}</DialogDescription>
           </DialogHeader>
-          <DialogPanel className="space-y-4">
+          <DialogPanel className="space-y-4 max-sm:px-4">
             <div className="space-y-3 rounded-xl bg-zinc-25 p-3 text-sm ring-1 ring-black/5 dark:bg-white/[0.035] dark:ring-white/5">
               <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-1">
                 <span className="text-muted-foreground">Branch</span>
@@ -1843,7 +1843,7 @@ export default function GitActionsControl({
                           return (
                             <div
                               key={file.path}
-                              className="flex w-full items-center gap-2 rounded-md px-2 py-1 font-mono hover:bg-accent/50"
+                              className="flex min-h-11 w-full items-center gap-2 rounded-md px-2 py-1 font-mono hover:bg-accent/50"
                             >
                               {isEditingFiles && (
                                 <Checkbox
@@ -1910,7 +1910,10 @@ export default function GitActionsControl({
               />
             </div>
           </DialogPanel>
-          <DialogFooter variant="bare">
+          <DialogFooter
+            variant="bare"
+            className="max-sm:[&_[data-slot=button]]:min-h-11 max-sm:[&_[data-slot=button]]:w-full"
+          >
             <Button
               variant="outline"
               size="sm"

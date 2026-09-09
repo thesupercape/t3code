@@ -1,4 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
+import * as NodePath from "node:path";
 
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
@@ -420,6 +422,46 @@ function parseGitRemoteVerboseOutput(
   return remotes;
 }
 
+const sanitizeCheckpointOutput = (value: string, truncated: boolean): string => {
+  const redacted = value
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, "$1[REDACTED]")
+    .replace(/(bearer\s+)[^\s]+/gi, "$1[REDACTED]")
+    .replace(/(token|password|passwd|secret|api[_-]?key)\s*[=:]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/gh[pousr]_[A-Za-z0-9_]+/g, "[REDACTED]")
+    .replace(/github_pat_[A-Za-z0-9_]+/g, "[REDACTED]");
+  const bounded =
+    redacted.length > 4_096 ? `${redacted.slice(0, 4_096)}\n[output capped]` : redacted;
+  return truncated && !bounded.includes("[output capped]")
+    ? `${bounded}\n[output truncated]`
+    : bounded;
+};
+
+const checkpointRestoreFailureDetail = (input: {
+  readonly operation: string;
+  readonly cwd: string;
+  readonly checkpointRef: string;
+  readonly commitOid: string;
+  readonly error: VcsProcessExitError;
+}): string => {
+  const stdout = sanitizeCheckpointOutput(
+    input.error.stdout ?? "",
+    input.error.stdoutTruncated ?? false,
+  );
+  const stderr = sanitizeCheckpointOutput(
+    input.error.stderr ?? "",
+    input.error.stderrTruncated ?? false,
+  );
+  return JSON.stringify({
+    operation: input.operation,
+    cwd: input.cwd,
+    checkpointRef: input.checkpointRef,
+    commitOid: input.commitOid,
+    exitCode: input.error.exitCode,
+    stdout,
+    stderr,
+  });
+};
+
 const gitCommand = (
   process: VcsProcess.VcsProcess["Service"],
   operation: string,
@@ -511,10 +553,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       ["rev-parse", "--git-common-dir"],
     ).pipe(Effect.orElseSucceed(() => null));
 
+    const metadataPath = gitCommonDir?.stdout.trim() || null;
     return {
       kind: "git" as const,
       rootPath: root.stdout.trim(),
-      metadataPath: gitCommonDir?.stdout.trim() || null,
+      metadataPath:
+        metadataPath === null
+          ? null
+          : path.isAbsolute(metadataPath)
+            ? metadataPath
+            : path.resolve(cwd, metadataPath),
       freshness: yield* nowFreshness(),
     };
   });
@@ -700,6 +748,91 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
       }),
     );
 
+  const checkpointRefExists = (cwd: string, checkpointRef: string) =>
+    execute({
+      operation: "GitVcsDriver.checkpoints.checkpointRefExists",
+      cwd,
+      args: ["show-ref", "--verify", "--quiet", checkpointRef],
+      allowNonZeroExit: true,
+    }).pipe(Effect.map((result) => result.exitCode === 0));
+
+  const normalizedPath = (value: string, base: string) =>
+    NodePath.normalize(NodePath.resolve(base, value))
+      .replace(/[\\/]$/, "")
+      .toLowerCase();
+
+  const canonicalPath = (value: string, base: string) => {
+    const absolute = NodePath.resolve(base, value);
+    return fileSystem.realPath(absolute).pipe(
+      Effect.orElseSucceed(() => absolute),
+      Effect.map((resolved) => normalizedPath(resolved, "/")),
+    );
+  };
+
+  const repositoryPathsEqual = (left: string, leftBase: string, right: string, rightBase: string) =>
+    Effect.all([canonicalPath(left, leftBase), canonicalPath(right, rightBase)]).pipe(
+      Effect.map(([resolvedLeft, resolvedRight]) => resolvedLeft === resolvedRight),
+    );
+
+  const resolveBranch = (cwd: string) =>
+    execute({
+      operation: "GitVcsDriver.checkpoints.resolveBranch",
+      cwd,
+      args: ["symbolic-ref", "--short", "--quiet", "HEAD"],
+      allowNonZeroExit: true,
+    }).pipe(
+      Effect.map((result) => {
+        const branch = result.stdout.trim();
+        return result.exitCode === 0 && branch.length > 0 ? branch : null;
+      }),
+    );
+
+  const currentWorktreeDiffersFrom = (cwd: string, commitOid: string) =>
+    Effect.gen(function* () {
+      const gitCommonDir = yield* resolveGitCommonDir(cwd);
+      const tempIndexPath = path.join(
+        gitCommonDir,
+        `t3-checkpoint-compare-index-${NodeCrypto.randomUUID()}`,
+      );
+      const compareEnv: NodeJS.ProcessEnv = { ...process.env, GIT_INDEX_FILE: tempIndexPath };
+      const cleanupTempIndex = fileSystem
+        .remove(tempIndexPath, { force: true })
+        .pipe(Effect.ignore);
+
+      return yield* Effect.gen(function* () {
+        yield* execute({
+          operation: "GitVcsDriver.checkpoints.prepareCurrentWorktreeComparison",
+          cwd,
+          args: ["read-tree", commitOid],
+          env: compareEnv,
+        });
+        yield* execute({
+          operation: "GitVcsDriver.checkpoints.refreshCurrentWorktreeComparison",
+          cwd,
+          args: ["update-index", "--refresh"],
+          env: compareEnv,
+          allowNonZeroExit: true,
+        });
+        const tracked = yield* execute({
+          operation: "GitVcsDriver.checkpoints.compareCurrentWorktree",
+          cwd,
+          args: ["diff-files", "--quiet"],
+          env: compareEnv,
+          allowNonZeroExit: true,
+        });
+        if (tracked.exitCode !== 0) return true;
+
+        const untracked = yield* execute({
+          operation: "GitVcsDriver.checkpoints.checkCurrentWorktreeStatus",
+          cwd,
+          args: ["ls-files", "--others", "--exclude-standard"],
+          env: compareEnv,
+          allowNonZeroExit: true,
+        });
+        return untracked.stdout.trim().length > 0;
+      }).pipe(Effect.ensuring(cleanupTempIndex));
+    });
+
   const resolveGitCommonDir = (cwd: string) =>
     Effect.gen(function* () {
       const result = yield* execute({
@@ -801,37 +934,146 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     restoreCheckpoint: Effect.fn("GitVcsDriver.checkpoints.restoreCheckpoint")(function* (input) {
       const operation = "GitVcsDriver.checkpoints.restoreCheckpoint";
 
-      let commitOid = yield* resolveCheckpointCommit(input.cwd, input.checkpointRef);
-
-      if (!commitOid && input.fallbackToHead === true) {
-        commitOid = yield* resolveHeadCommit(input.cwd);
+      const repository = yield* detectRepository(input.cwd).pipe(
+        Effect.catch(() => Effect.succeed(null)),
+      );
+      if (!repository) {
+        return {
+          restored: false,
+          reason: "workspace-unavailable",
+          detail: "The configured workspace is not an available Git worktree.",
+        };
+      }
+      const expectedRootRepository = input.expectedRepositoryRoot
+        ? yield* detectRepository(input.expectedRepositoryRoot).pipe(
+            Effect.catch(() => Effect.succeed(null)),
+          )
+        : null;
+      const repositoryMatchesExpectedRoot = input.expectedRepositoryRoot
+        ? expectedRootRepository !== null &&
+          (repository.metadataPath && expectedRootRepository.metadataPath
+            ? yield* repositoryPathsEqual(
+                repository.metadataPath,
+                input.cwd,
+                expectedRootRepository.metadataPath,
+                input.expectedRepositoryRoot,
+              )
+            : yield* repositoryPathsEqual(
+                repository.rootPath,
+                input.cwd,
+                expectedRootRepository.rootPath,
+                input.expectedRepositoryRoot,
+              ))
+        : true;
+      const repositoryMatchesExpectedIdentity = input.expectedRepository
+        ? repository.metadataPath && input.expectedRepository.metadataPath
+          ? yield* repositoryPathsEqual(
+              repository.metadataPath,
+              input.cwd,
+              input.expectedRepository.metadataPath,
+              input.cwd,
+            )
+          : yield* repositoryPathsEqual(
+              repository.rootPath,
+              input.cwd,
+              input.expectedRepository.rootPath,
+              input.cwd,
+            )
+        : true;
+      const repositoryMatchesExpected =
+        repositoryMatchesExpectedRoot && repositoryMatchesExpectedIdentity;
+      if (!repositoryMatchesExpected) {
+        return {
+          restored: false,
+          reason: "repository-mismatch",
+          detail: "The configured workspace belongs to a different repository.",
+        };
       }
 
+      if (input.expectedBranch !== undefined && input.expectedBranch !== null) {
+        const branch = yield* resolveBranch(input.cwd);
+        if (branch !== input.expectedBranch) {
+          return {
+            restored: false,
+            reason: "branch-mismatch",
+            detail: `The workspace is on '${branch ?? "detached HEAD"}', not '${input.expectedBranch}'.`,
+          };
+        }
+      }
+
+      const targetRefExists = yield* checkpointRefExists(input.cwd, input.checkpointRef);
+      const commitOid = targetRefExists
+        ? yield* resolveCheckpointCommit(input.cwd, input.checkpointRef)
+        : input.fallbackToHead === true
+          ? yield* resolveHeadCommit(input.cwd)
+          : null;
       if (!commitOid) {
-        return false;
+        return {
+          restored: false,
+          reason: targetRefExists ? "checkpoint-invalid" : "checkpoint-missing",
+          detail: targetRefExists
+            ? `Checkpoint ref '${input.checkpointRef}' does not resolve to a commit.`
+            : `Checkpoint ref '${input.checkpointRef}' is missing.`,
+        };
       }
 
-      yield* execute({
+      if (input.expectedCurrentCheckpointRef) {
+        const resolvedCurrentCommitOid = yield* resolveCheckpointCommit(
+          input.cwd,
+          input.expectedCurrentCheckpointRef,
+        );
+        const currentCommitOid =
+          resolvedCurrentCommitOid ??
+          (input.fallbackToHead === true &&
+          input.expectedCurrentCheckpointRef === input.checkpointRef
+            ? yield* resolveHeadCommit(input.cwd)
+            : null);
+        if (!currentCommitOid) {
+          return {
+            restored: false,
+            reason: "current-checkpoint-missing",
+            detail: `Current checkpoint ref '${input.expectedCurrentCheckpointRef}' is missing.`,
+          };
+        }
+        if (yield* currentWorktreeDiffersFrom(input.cwd, currentCommitOid)) {
+          return {
+            restored: false,
+            reason: "current-worktree-dirty",
+            detail:
+              "The workspace changed after the latest checkpoint; no user changes were overwritten.",
+          };
+        }
+      }
+
+      if (input.validateOnly === true) {
+        return { restored: true, commitOid };
+      }
+
+      const restoreResult = yield* execute({
         operation,
         cwd: input.cwd,
         args: ["restore", "--source", commitOid, "--worktree", "--staged", "--", "."],
-      });
-      yield* execute({
-        operation,
-        cwd: input.cwd,
-        args: ["clean", "-fd", "--", "."],
-      });
+      }).pipe(
+        Effect.catchTag("VcsProcessExitError", (error) =>
+          Effect.succeed({
+            restored: false as const,
+            reason: "checkpoint-invalid" as const,
+            detail: checkpointRestoreFailureDetail({
+              operation,
+              cwd: input.cwd,
+              checkpointRef: input.checkpointRef,
+              commitOid,
+              error,
+            }),
+          }),
+        ),
+      );
 
-      const headExists = yield* hasHeadCommit(input.cwd);
-      if (headExists) {
-        yield* execute({
-          operation,
-          cwd: input.cwd,
-          args: ["reset", "--quiet", "--", "."],
-        });
+      if ("restored" in restoreResult) {
+        return restoreResult;
       }
 
-      return true;
+      return { restored: true, commitOid };
     }),
 
     diffCheckpoints: Effect.fn("GitVcsDriver.checkpoints.diffCheckpoints")(function* (input) {

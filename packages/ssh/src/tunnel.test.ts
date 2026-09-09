@@ -130,6 +130,22 @@ describe("ssh tunnel scripts", () => {
     assert.notInclude(script, "ensure $NVM_DIR/nvm.sh is available");
   });
 
+  it("starts the remote backend through the user's login shell exactly once", () => {
+    const script = buildRemoteT3RunnerScript({ nodeEngineRange: TEST_NODE_ENGINE_RANGE });
+
+    assert.include(script, 'if [ "${T3CODE_REMOTE_LOGIN_SHELL_LOADED:-0}" != "1" ]');
+    assert.include(script, "*/zsh|*/bash|*/sh|*/ksh)");
+    assert.include(
+      script,
+      `exec "$SHELL" -lic 'exec "$T3CODE_REMOTE_RUNNER_PATH" "$@"' t3-code-remote "$@"`,
+    );
+    assert.include(script, "unset T3CODE_REMOTE_LOGIN_SHELL_LOADED T3CODE_REMOTE_RUNNER_PATH");
+    assert.isBelow(
+      script.indexOf('exec "$SHELL" -lic'),
+      script.indexOf("ensure_remote_node_path || true"),
+    );
+  });
+
   it("does not hard-code a remote node engine range", () => {
     const script = buildRemoteT3RunnerScript();
 

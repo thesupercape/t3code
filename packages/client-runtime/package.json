@@ -3,17 +3,17 @@
   "private": true,
   "type": "module",
   "exports": {
-    "./load-balancing": {
-      "types": "./src/load-balancing.ts",
-      "default": "./src/load-balancing.ts"
+    "./usageRefresh": {
+      "types": "./src/usageRefresh.ts",
+      "default": "./src/usageRefresh.ts"
     },
-    "./project-favicon-cache": {
-      "types": "./src/projectFaviconCache.ts",
-      "default": "./src/projectFaviconCache.ts"
+    "./resetCheckPresentation": {
+      "types": "./src/resetCheckPresentation.ts",
+      "default": "./src/resetCheckPresentation.ts"
     },
-    "./pending-requests": {
-      "types": "./src/pendingRequests.ts",
-      "default": "./src/pendingRequests.ts"
+    "./resetAnnouncements": {
+      "types": "./src/resetAnnouncements.ts",
+      "default": "./src/resetAnnouncements.ts"
     },
     "./connection": {
       "types": "./src/connection/index.ts",
@@ -47,9 +47,9 @@
       "types": "./src/mediaActions.ts",
       "default": "./src/mediaActions.ts"
     },
-    "./codex-file-citations": {
-      "types": "./src/codexFileCitations.ts",
-      "default": "./src/codexFileCitations.ts"
+    "./load-balancing": {
+      "types": "./src/load-balancing.ts",
+      "default": "./src/load-balancing.ts"
     },
     "./codex-artifact-templates": {
       "types": "./src/codexArtifactTemplates.ts",
@@ -83,9 +83,21 @@
       "types": "./src/providerSkills.ts",
       "default": "./src/providerSkills.ts"
     },
+    "./project-favicon-cache": {
+      "types": "./src/projectFaviconCache.ts",
+      "default": "./src/projectFaviconCache.ts"
+    },
+    "./diagnostics": {
+      "types": "./src/diagnostics.ts",
+      "default": "./src/diagnostics.ts"
+    },
     "./voice-input": {
       "types": "./src/voice-input/index.ts",
       "default": "./src/voice-input/index.ts"
+    },
+    "./pending-requests": {
+      "types": "./src/pendingRequests.ts",
+      "default": "./src/pendingRequests.ts"
     },
     "./relay": {
       "types": "./src/relay/index.ts",
@@ -163,10 +175,6 @@
       "types": "./src/state/runtime.ts",
       "default": "./src/state/runtime.ts"
     },
-    "./state/usage": {
-      "types": "./src/state/usage.ts",
-      "default": "./src/state/usage.ts"
-    },
     "./state/server": {
       "types": "./src/state/server.ts",
       "default": "./src/state/server.ts"
@@ -175,13 +183,13 @@
       "types": "./src/state/session.ts",
       "default": "./src/state/session.ts"
     },
-    "./state/shared-settings": {
-      "types": "./src/state/sharedSettings.ts",
-      "default": "./src/state/sharedSettings.ts"
-    },
     "./state/shell": {
       "types": "./src/state/shell.ts",
       "default": "./src/state/shell.ts"
+    },
+    "./state/shared-settings": {
+      "types": "./src/state/sharedSettings.ts",
+      "default": "./src/state/sharedSettings.ts"
     },
     "./state/source-control": {
       "types": "./src/state/sourceControl.ts",
@@ -214,6 +222,10 @@
     "./state/vcs": {
       "types": "./src/state/vcs.ts",
       "default": "./src/state/vcs.ts"
+    },
+    "./state/workers": {
+      "types": "./src/state/workers.ts",
+      "default": "./src/state/workers.ts"
     },
     "./work-log/presentation": {
       "types": "./src/work-log/presentation.ts",

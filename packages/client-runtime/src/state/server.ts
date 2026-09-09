@@ -1048,6 +1048,33 @@ export function createServerEnvironmentAtoms<R, E>(
       staleTimeMs: 60_000,
       refreshTrigger: ({ environmentId }) => usagePricesAtom(environmentId),
     }),
+    resetCheck: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:reset-check",
+      tag: WS_METHODS.serverGetResetCheck,
+      staleTimeMs: 1_000,
+    }),
+    communityCheck: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:community-check",
+      tag: WS_METHODS.serverGetCommunityCheck,
+      staleTimeMs: 1_000,
+    }),
+    startCommunityCheck: createEnvironmentRpcCommand(runtime, {
+      label: "environment-command:server:start-community-check",
+      tag: WS_METHODS.serverStartCommunityCheck,
+    }),
+    cancelCommunityCheck: createEnvironmentRpcCommand(runtime, {
+      label: "environment-command:server:cancel-community-check",
+      tag: WS_METHODS.serverCancelCommunityCheck,
+    }),
+    startResetCheck: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:start-reset-check",
+      tag: WS_METHODS.serverStartResetCheck,
+      concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
+    }),
+    cancelResetCheck: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:cancel-reset-check",
+      tag: WS_METHODS.serverCancelResetCheck,
+    }),
     configProjection,
     welcome,
     consumeResetCredit: createEnvironmentRpcCommand(runtime, {

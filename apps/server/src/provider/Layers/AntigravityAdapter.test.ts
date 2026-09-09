@@ -32,6 +32,7 @@ import {
   type AcpToolCallState,
 } from "../acp/AcpRuntimeModel.ts";
 import { makeAntigravityAdapter, type AntigravityAdapterOptions } from "./AntigravityAdapter.ts";
+import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
 const instanceId = ProviderInstanceId.make("antigravity-test");
 const threadId = ThreadId.make("antigravity-thread");
@@ -1268,6 +1269,31 @@ it.layer(layer)("AntigravityAdapter", (it) => {
         path: path.join(cwd, "missing.txt"),
       }).pipe(Effect.flip);
       expect(missing._tag).toBe("AcpRequestError");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.skipIf(!symlinksSupported)("rejects writes through a dangling symlink", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const h = yield* makeHarness();
+      const { attachmentsDir } = yield* ServerConfig;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-dangling-" });
+      const outside = yield* fs.makeTempDirectoryScoped({ prefix: "t3-agy-dangling-outside-" });
+      const dangling = path.join(cwd, "dangling.txt");
+      yield* fs.symlink(path.join(outside, "missing.txt"), dangling);
+      yield* h.adapter.startSession({ threadId, cwd, runtimeMode: "approval-required" });
+      expect(h.launches[0]?.additionalDirectories).toEqual([attachmentsDir]);
+      const write = h.fileHandlers.write;
+      if (!write) return yield* Effect.die("File handler was not registered.");
+
+      const error = yield* write({
+        sessionId: nativeSessionId,
+        path: dangling,
+        content: "must not follow dangling link",
+      }).pipe(Effect.flip);
+      expect(error._tag).toBe("AcpRequestError");
+      expect(yield* fs.exists(path.join(outside, "missing.txt"))).toBe(false);
     }).pipe(Effect.scoped),
   );
 

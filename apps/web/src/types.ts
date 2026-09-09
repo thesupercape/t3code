@@ -48,7 +48,9 @@ export interface ChatFileAttachment extends ContractChatFileAttachment {
 // Attachment types this build does not know pass through with the contract
 // shape. The UI renders them as inert rows so a newer server cannot crash an
 // older client.
-export type ChatUnknownAttachment = ContractChatUnknownAttachment;
+export type ChatUnknownAttachment = ContractChatUnknownAttachment & {
+  readonly previewUrl?: string;
+};
 
 export type ChatAttachment = ChatImageAttachment | ChatFileAttachment | ChatUnknownAttachment;
 

@@ -4,6 +4,31 @@ For one account, use the default Codex provider with your normal Codex login.
 [Provider setup](./install.md#providers) covers installation, Settings > Providers,
 and custom binaries or environment variables.
 
+## Open native Codex chats
+
+Choose **Codex chats** in the sidebar to view your existing native Codex sessions.
+This view keeps Codex conversations separate from your T3 chats while still
+letting you search sessions, read their messages and tool activity, and send a
+follow-up from the same conversation. A direct link keeps the selected session
+open when you refresh or return to it later.
+
+The view works in the T3 Code desktop app, in a desktop browser, and in a mobile
+browser. The native React Native mobile app does not include this view; use the
+mobile browser when you need to reach native Codex sessions from a phone.
+
+Sending a follow-up requires the Codex host to be connected. T3 reports delivery
+as queued, sent, failed, or unconfirmed; the native Codex session remains the
+source of truth for the assistant turn and its progress. If the host is
+unavailable, reconnect it before sending. T3 watches a delivered turn for up to
+five minutes; if it is still running, choose **Keep watching** or refresh the
+conversation to continue observing it.
+
+Native Codex permission settings and the connected host's project policy
+continue to apply to these sessions. T3 can show that a session needs
+attention, but it cannot approve a Codex request that the connected host does
+not support. Use the native Codex session when it asks for an approval or other
+interaction.
+
 ## Use multiple accounts
 
 A shared Codex home with a shadow home lets work and personal accounts continue

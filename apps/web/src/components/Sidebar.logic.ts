@@ -4,7 +4,12 @@ import {
   isAtomCommandInterrupted,
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
-import type { ContextMenuItem } from "@t3tools/contracts";
+import type { ContextMenuItem, OrchestrationThreadShell } from "@t3tools/contracts";
+import {
+  effectiveSettled,
+  effectiveSnoozed,
+  type ChangeRequestSettleSource,
+} from "@t3tools/client-runtime/state/thread-settled";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@t3tools/contracts/settings";
 import type { AsyncResult } from "effect/unstable/reactivity";
 import { planPinnedReorder } from "@t3tools/client-runtime/state/thread-sort";
@@ -32,6 +37,37 @@ const SIDEBAR_THREAD_PREWARM_LIMIT = 3;
 // A small buffer keeps the next few rows warm without leasing every row that
 // content-visibility leaves mounted below the scroll viewport.
 const SIDEBAR_ROW_SUBSCRIPTION_OVERSCAN_PX = 160;
+
+export type SidebarThreadSection = "snoozed" | "settled" | "pinned" | "active";
+
+export function resolveSidebarThreadSection(
+  thread: OrchestrationThreadShell,
+  input: {
+    readonly supportsSettlement: boolean;
+    readonly supportsSnooze: boolean;
+    readonly now: string;
+    readonly preciseNow: string;
+    readonly autoSettleAfterDays: number | null;
+    readonly autoSettleOnMerge: boolean;
+    readonly changeRequest: ChangeRequestSettleSource | null;
+  },
+): SidebarThreadSection {
+  if (input.supportsSnooze && effectiveSnoozed(thread, { now: input.preciseNow })) return "snoozed";
+  if (
+    input.supportsSettlement &&
+    effectiveSettled(thread, {
+      now: input.now,
+      autoSettleAfterDays: input.autoSettleAfterDays,
+      autoSettleOnMerge: input.autoSettleOnMerge,
+      changeRequest: input.changeRequest,
+    })
+  )
+    return "settled";
+  return thread.pinnedAt != null ? "pinned" : "active";
+}
+
+export const animatePinnedLayoutChanges: AnimateLayoutChanges = (args) =>
+  args.isSorting ? defaultAnimateLayoutChanges(args) : false;
 
 export function useSidebarRowSubscriptionLease(isActive: boolean): {
   readonly leaseLiveStatus: boolean;
@@ -865,6 +901,23 @@ function firstValidTimestamp(
     if (!Number.isNaN(Date.parse(candidate))) return candidate;
   }
   return null;
+}
+
+export function resolveSettledTimestamp(
+  thread: Pick<
+    SidebarThreadSummary,
+    "settledAt" | "latestUserMessageAt" | "latestTurn" | "updatedAt"
+  >,
+): string | null {
+  const settledAt = firstValidTimestamp(thread.settledAt);
+  if (settledAt !== null) return settledAt;
+  return firstValidTimestamp(
+    thread.latestUserMessageAt,
+    thread.latestTurn?.requestedAt,
+    thread.latestTurn?.startedAt,
+    thread.latestTurn?.completedAt,
+    thread.updatedAt,
+  );
 }
 
 export { sortActiveThreadsByOrderKey as sortThreadsForSidebar } from "@t3tools/client-runtime/state/thread-sort";

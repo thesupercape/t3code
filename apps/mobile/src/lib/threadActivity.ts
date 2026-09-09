@@ -1,10 +1,15 @@
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
+  derivePendingRequests,
   requestKindFromRequestType,
   type PendingApproval,
 } from "@t3tools/client-runtime/pending-requests";
-import { UserInputAttachmentAnswerPayload, isToolLifecycleItemType } from "@t3tools/contracts";
+import {
+  UserInputAttachmentAnswerPayload,
+  isToolLifecycleItemType,
+  type ToolScreenshot,
+} from "@t3tools/contracts";
 import type {
   OrchestrationLatestTurn,
   OrchestrationThread,
@@ -14,6 +19,7 @@ import type {
   UserInputQuestion,
 } from "@t3tools/contracts";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
+import { toolScreenshotFromItem } from "@t3tools/shared/toolScreenshot";
 import {
   commandDetailRepeatsCommand,
   extractCommandOutputText,
@@ -40,6 +46,12 @@ import * as Order from "effect/Order";
 
 export type { PendingApproval, PendingUserInput } from "@t3tools/client-runtime/pending-requests";
 
+export const derivePendingApprovals = (activities: ReadonlyArray<OrchestrationThreadActivity>) =>
+  derivePendingRequests(activities).approvals;
+
+export const derivePendingUserInputs = (activities: ReadonlyArray<OrchestrationThreadActivity>) =>
+  derivePendingRequests(activities).userInputs;
+
 export interface PendingUserInputDraftAnswer {
   readonly selectedOptionValues?: ReadonlyArray<string>;
   readonly customAnswer?: string;
@@ -48,6 +60,7 @@ export interface PendingUserInputDraftAnswer {
 }
 
 export interface ThreadFeedActivity {
+  readonly screenshot?: ToolScreenshot;
   readonly id: string;
   readonly createdAt: string;
   readonly turnId: TurnId | null;
@@ -2172,7 +2185,8 @@ export function buildPendingUserInputAnswers(
 }
 
 export function buildThreadFeed(
-  thread: Pick<OrchestrationThread, "messages" | "activities">,
+  thread: Pick<OrchestrationThread, "messages" | "activities"> &
+    Partial<Pick<OrchestrationThread, "id">>,
   options?: {
     readonly loadedMessages?: ReadonlyArray<OrchestrationThread["messages"][number]>;
     readonly localMessages?: ReadonlyArray<OrchestrationThread["messages"][number]>;
@@ -2184,7 +2198,7 @@ export function buildThreadFeed(
     : loadedMessages;
   const oldestLoadedMessageCreatedAt =
     options?.loadedMessages !== undefined ? (loadedMessages[0]?.createdAt ?? null) : null;
-  const activityEntries = getThreadFeedActivityEntries(thread.activities);
+  const activityEntries = getThreadFeedActivityEntries(thread.activities, thread.id);
   const entries = Arr.sortWith(
     [
       ...messages.map((message) => {
@@ -2207,16 +2221,22 @@ export function buildThreadFeed(
   return groupAdjacentActivities(entries);
 }
 
-function getThreadFeedActivityEntries(activities: ReadonlyArray<OrchestrationThreadActivity>) {
+function getThreadFeedActivityEntries(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  threadId: string | undefined,
+) {
   const cached = activityEntriesCache.get(activities);
   if (cached) return cached;
-  const entries = deriveWorkLogEntries(activities).map(toThreadFeedActivityEntry);
+  const entries = deriveWorkLogEntries(activities).map((entry) =>
+    toThreadFeedActivityEntry(entry, threadId),
+  );
   activityEntriesCache.set(activities, entries);
   return entries;
 }
 
 function toThreadFeedActivityEntry(
   entry: DerivedWorkLogEntry,
+  threadId: string | undefined,
 ): Extract<RawThreadFeedEntry, { readonly type: "activity" }> {
   const summary = workEntryHeading(entry);
   const detail = workEntryPreview(entry);
@@ -2254,6 +2274,10 @@ function toThreadFeedActivityEntry(
       icon: workEntryIcon(entry),
       toolLike: workLogEntryIsToolLike(entry),
       status: workEntryStatus(entry),
+      ...(() => {
+        const screenshot = toolScreenshotFromItem(entry.toolData, threadId);
+        return screenshot === null ? {} : { screenshot };
+      })(),
       ...(entry.toolLifecycleStatus ? { lifecycleStatus: entry.toolLifecycleStatus } : {}),
       workEntry: entry,
     },

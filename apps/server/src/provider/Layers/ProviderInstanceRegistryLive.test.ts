@@ -30,6 +30,7 @@ import {
   type CursorSettings,
   type GrokSettings,
   type OpenCodeSettings,
+  EnvironmentId,
   ProviderDriverKind,
   type ProviderInstanceConfigMap,
   ProviderInstanceId,
@@ -44,9 +45,11 @@ import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+import * as PreviewAutomationBroker from "../../mcp/PreviewAutomationBroker.ts";
 import type { BuiltInDriversEnv } from "../builtInDrivers.ts";
 import { AntigravityInstallation } from "../AntigravityInstallation.ts";
 import { ServerConfig } from "../../config.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ClaudeDriver } from "../Drivers/ClaudeDriver.ts";
@@ -65,6 +68,25 @@ const TestHttpClientLive = Layer.succeed(
   HttpClient.make((request) =>
     Effect.succeed(HttpClientResponse.fromWeb(request, Response.json({ version: "0.0.0" }))),
   ),
+);
+
+const PreviewAutomationBrokerTestLayer = Layer.mock(
+  PreviewAutomationBroker.PreviewAutomationBroker,
+)({
+  isBrowserAvailable: () => Effect.succeed(false),
+  streamBrowserAvailability: () => Stream.empty,
+  connect: () => Effect.die("unused connect"),
+  focusHost: () => Effect.die("unused focus"),
+  respond: () => Effect.die("unused respond"),
+  invoke: () => Effect.die("unused invoke"),
+});
+
+const ServerEnvironmentTestLayer = Layer.succeed(
+  ServerEnvironment.ServerEnvironment,
+  ServerEnvironment.ServerEnvironment.of({
+    getEnvironmentId: Effect.succeed(EnvironmentId.make("test-environment")),
+    getDescriptor: Effect.die("unused descriptor"),
+  }),
 );
 
 const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
@@ -104,6 +126,7 @@ const makeCodexConfig = (overrides: Partial<CodexSettings>): CodexSettings => ({
   homePath: "",
   shadowHomePath: "",
   launchArgs: "",
+  useDesktopAppDaemon: false,
   customModels: [],
   ...overrides,
 });
@@ -229,6 +252,8 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(TestHttpClientLive),
+    Layer.provideMerge(PreviewAutomationBrokerTestLayer),
+    Layer.provideMerge(ServerEnvironmentTestLayer),
     Layer.provideMerge(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
     Layer.provideMerge(ModelManifest.layerTest),
     Layer.provideMerge(CodexResetCredit.layerTest),
@@ -263,7 +288,7 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
         },
       };
 
-      const { registry } = yield* makeProviderInstanceRegistry({
+      const { registry } = yield* makeProviderInstanceRegistry<BuiltInDriversEnv>({
         drivers: [CodexDriver],
         configMap,
       });
@@ -370,7 +395,7 @@ describe("ProviderInstanceRegistryLive — multi-instance codex slice", () => {
         },
       };
 
-      const { registry } = yield* makeProviderInstanceRegistry({
+      const { registry } = yield* makeProviderInstanceRegistry<BuiltInDriversEnv>({
         drivers: [CodexDriver, ClaudeDriver],
         configMap,
       });
@@ -457,6 +482,8 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
     Layer.provideMerge(BackgroundPolicyAlwaysRunLayer),
     Layer.provideMerge(ServerSettingsService.layerTest()),
     Layer.provideMerge(TestHttpClientLive),
+    Layer.provideMerge(PreviewAutomationBrokerTestLayer),
+    Layer.provideMerge(ServerEnvironmentTestLayer),
     Layer.provideMerge(Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers)),
     Layer.provideMerge(ModelManifest.layerTest),
     Layer.provideMerge(CodexResetCredit.layerTest),

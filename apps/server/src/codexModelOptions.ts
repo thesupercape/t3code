@@ -7,8 +7,8 @@ import {
 export function getCodexServiceTierOptionValue(
   modelSelection: ModelSelection | null | undefined,
 ): string | undefined {
-  return (
-    getModelSelectionStringOptionValue(modelSelection, "serviceTier") ??
-    (getModelSelectionBooleanOptionValue(modelSelection, "fastMode") === true ? "fast" : undefined)
-  );
+  const serviceTier = getModelSelectionStringOptionValue(modelSelection, "serviceTier");
+  if (serviceTier !== undefined) return serviceTier;
+  const fastMode = getModelSelectionBooleanOptionValue(modelSelection, "fastMode");
+  return fastMode === undefined ? undefined : fastMode ? "fast" : "default";
 }

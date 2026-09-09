@@ -230,11 +230,43 @@ const resolveClientFilePath = Effect.fn("AntigravityAdapter.resolveClientFilePat
   }) {
     const { path } = input;
     const resolved = path.resolve(input.requestPath);
-    // Follow symlinks on the parent so a link out of the workspace cannot escape it.
-    const parent = yield* input.fileSystem
-      .realPath(path.dirname(resolved))
-      .pipe(Effect.orElseSucceed(() => path.dirname(resolved)));
-    const real = path.join(parent, path.basename(resolved));
+    // Follow symlinks through the nearest existing ancestor. Writes may target
+    // a new nested file, so resolving only its immediate (not-yet-created)
+    // parent would fall back to the lexical `/var` spelling on macOS while the
+    // allowed root resolves to `/private/var`, incorrectly rejecting a safe
+    // in-workspace write.
+    const real = yield* Effect.gen(function* () {
+      let candidate = resolved;
+      const suffix: string[] = [];
+      while (true) {
+        const existing = yield* input.fileSystem.realPath(candidate).pipe(Effect.option);
+        if (Option.isSome(existing)) {
+          return path.join(existing.value, ...suffix.reverse());
+        }
+        const linkState = yield* input.fileSystem.readLink(candidate).pipe(
+          Effect.map(() => "symlink" as const),
+          Effect.catchTag("PlatformError", (error) =>
+            Effect.succeed(
+              error.reason._tag === "NotFound" ? ("missing" as const) : ("unresolvable" as const),
+            ),
+          ),
+        );
+        if (linkState === "symlink") {
+          return yield* EffectAcpErrors.AcpRequestError.invalidParams(
+            `Path '${input.requestPath}' could not be resolved safely.`,
+          );
+        }
+        if (linkState === "unresolvable") {
+          return yield* EffectAcpErrors.AcpRequestError.invalidParams(
+            `Path '${input.requestPath}' could not be resolved safely.`,
+          );
+        }
+        const parent = path.dirname(candidate);
+        if (parent === candidate) return resolved;
+        suffix.push(path.basename(candidate));
+        candidate = parent;
+      }
+    });
     const roots = yield* Effect.forEach(input.allowedRoots, (root) =>
       input.fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root)),
     );

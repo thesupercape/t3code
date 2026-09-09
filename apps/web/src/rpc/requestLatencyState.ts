@@ -30,7 +30,8 @@ interface PendingRpcAckRequest {
 const pendingRpcAckRequests = new Map<string, PendingRpcAckRequest>();
 const untrackedRpcAckMethods = new Set<string>([
   WS_METHODS.previewAutomationConnect,
-  WS_METHODS.serverGetUsageSummary,
+  // A Worker wait is an expected event lease, not a slow acknowledgement.
+  WS_METHODS.workersWait,
 ]);
 const longRunningRpcAckMethods = new Set<string>([
   WS_METHODS.serverUpdateProvider,
@@ -112,7 +113,7 @@ export function acknowledgeRpcRequest(requestId: string): void {
   setSlowRpcAckRequests(slowRequests.filter((request) => request.requestId !== requestId));
 }
 
-function clearAllTrackedRpcRequests(): void {
+export function clearAllTrackedRpcRequests(): void {
   for (const pending of pendingRpcAckRequests.values()) {
     clearTimeout(pending.timeoutId);
   }
@@ -154,6 +155,10 @@ function evictOldestPendingRpcRequestIfNeeded(): void {
 export function resetRequestLatencyStateForTests(): void {
   slowRpcAckThresholdMs = SLOW_RPC_ACK_THRESHOLD_MS;
   clearAllTrackedRpcRequests();
+}
+
+export function setSlowRpcAckThresholdMsForTests(thresholdMs: number): void {
+  slowRpcAckThresholdMs = thresholdMs;
 }
 
 export function useSlowRpcAckRequests(): ReadonlyArray<SlowRpcAckRequest> {

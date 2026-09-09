@@ -51,7 +51,10 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
   const path = yield* Path.Path;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const serverConfig = yield* Effect.service(ServerConfig.ServerConfig);
-  const resolvedEnvironment = environment ?? process.env;
+  // Callers may pass only the environment overrides they want to test or
+  // customize. Preserve the host PATH and other process defaults so a
+  // shebang-backed binary can still resolve its interpreter.
+  const resolvedEnvironment = { ...process.env, ...environment };
 
   type MaterializedImageAttachments = {
     readonly imagePaths: ReadonlyArray<string>;

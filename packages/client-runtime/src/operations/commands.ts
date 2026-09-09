@@ -1,5 +1,6 @@
 import {
   CommandId,
+  MessageId,
   ORCHESTRATION_WS_METHODS,
   type ClientOrchestrationCommand,
 } from "@t3tools/contracts";
@@ -17,16 +18,22 @@ import {
 
 type CommandType = ClientOrchestrationCommand["type"];
 type CommandOf<T extends CommandType> = Extract<ClientOrchestrationCommand, { readonly type: T }>;
-type CommandInput<T extends CommandType> = Omit<
-  CommandOf<T>,
+type CommandInputVariant<C extends ClientOrchestrationCommand> = Omit<
+  C,
   "type" | "commandId" | "createdAt"
 > & {
   readonly commandId?: CommandId;
-} & ("createdAt" extends keyof CommandOf<T>
+} & ("createdAt" extends keyof C
     ? {
-        readonly createdAt?: CommandOf<T>["createdAt"];
+        readonly createdAt?: C["createdAt"];
       }
     : {});
+type CommandInput<T extends CommandType> =
+  CommandOf<T> extends infer C
+    ? C extends ClientOrchestrationCommand
+      ? CommandInputVariant<C>
+      : never
+    : never;
 
 export type CreateProjectInput = CommandInput<"project.create">;
 export type UpdateProjectInput = CommandInput<"project.meta.update">;
@@ -47,11 +54,15 @@ export type UpdateThreadMetadataInput = CommandInput<"thread.meta.update">;
 export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
 export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
+export type SteerThreadTurnInput = Omit<CommandInput<"thread.turn.steer">, "messageId"> & {
+  readonly messageId?: MessageId;
+};
 export type InterruptThreadTurnInput = CommandInput<"thread.turn.interrupt">;
 export type RespondToThreadApprovalInput = CommandInput<"thread.approval.respond">;
 export type RespondToThreadUserInputInput = CommandInput<"thread.user-input.respond">;
 export type DismissThreadUserInputInput = CommandInput<"thread.user-input.dismiss">;
 export type RevertThreadCheckpointInput = CommandInput<"thread.checkpoint.revert">;
+export type EditThreadFromHereInput = CommandInput<"thread.edit-from-here">;
 export type StopThreadSessionInput = CommandInput<"thread.session.stop">;
 
 type DispatchTag = typeof ORCHESTRATION_WS_METHODS.dispatchCommand;
@@ -299,6 +310,20 @@ export const interruptThreadTurn: (input: InterruptThreadTurnInput) => CommandEf
   });
 });
 
+export const steerThreadTurn: (input: SteerThreadTurnInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.steerThreadTurn",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  const crypto = yield* Crypto.Crypto;
+  return yield* dispatch({
+    ...input,
+    type: "thread.turn.steer",
+    messageId: input.messageId ?? MessageId.make(yield* crypto.randomUUIDv4.pipe(Effect.orDie)),
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
+
 export const respondToThreadApproval: (input: RespondToThreadApprovalInput) => CommandEffect =
   Effect.fn("EnvironmentCommands.respondToThreadApproval")(function* (input) {
     const metadata = yield* timestampedCommandMetadata(input);
@@ -342,6 +367,26 @@ export const revertThreadCheckpoint: (input: RevertThreadCheckpointInput) => Com
       createdAt: metadata.createdAt,
     });
   });
+
+export const editThreadFromHere: (input: EditThreadFromHereInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.editThreadFromHere",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  if (input.mode === "branch") {
+    return yield* dispatch({
+      ...input,
+      type: "thread.edit-from-here",
+      commandId: metadata.commandId,
+      createdAt: metadata.createdAt,
+    });
+  }
+  return yield* dispatch({
+    ...input,
+    type: "thread.edit-from-here",
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
 
 export const stopThreadSession: (input: StopThreadSessionInput) => CommandEffect = Effect.fn(
   "EnvironmentCommands.stopThreadSession",

@@ -17,7 +17,7 @@
  * folding (completion can create an agent; a late start only fills
  * metadata).
  */
-import type { OrchestrationThreadActivity } from "@t3tools/contracts";
+import type { OrchestrationThreadActivity, RuntimeTaskLastTurn } from "@t3tools/contracts";
 
 export type RuntimeSubagentStatus =
   | "pending"
@@ -69,6 +69,7 @@ export interface RuntimeSubagent {
   readonly progress: string | null;
   readonly lastToolName: string | null;
   readonly result: string | null;
+  readonly lastTurn: RuntimeTaskLastTurn | null;
   readonly error: string | null;
   readonly outputFile: string | null;
   readonly parentAgentId: string | null;
@@ -238,6 +239,7 @@ interface MutableAgent {
   progress: string | null;
   lastToolName: string | null;
   result: string | null;
+  lastTurn: RuntimeTaskLastTurn | null;
   error: string | null;
   outputFile: string | null;
   parentAgentId: string | null;
@@ -295,6 +297,7 @@ function getOrCreate(
     progress: null,
     lastToolName: null,
     result: null,
+    lastTurn: null,
     error: null,
     outputFile: null,
     parentAgentId: asString(payload.parentAgentId) ?? null,

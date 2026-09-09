@@ -2,9 +2,9 @@ import { isElectron } from "~/env";
 import { isMacPlatform, isWindowsPlatform, normalizeSearchText } from "~/lib/utils";
 
 export type SettingsPath =
-  | "/settings/projects"
   | "/settings/general"
   | "/settings/appearance"
+  | "/settings/projects"
   | "/settings/keybindings"
   | "/settings/snap-shot"
   | "/settings/providers"
@@ -67,13 +67,21 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
  * that may not be mounted point at their nearest stable section instead.
  */
 export const SETTINGS_SEARCH_ITEMS = [
+  { id: "birthday-celebration", title: "Birthday celebration", to: "/settings/appearance" },
+  { id: "t3-workers", title: "T3 Workers", to: "/settings/general" },
   {
-    id: "project-defaults",
-    title: "Project defaults and overrides",
-    to: "/settings/projects",
-    searchTerms: [
-      "model workspace browser machines projects inheritance automatic pull checkout grouping actions scripts",
-    ],
+    id: "browser-link-target",
+    title: "Browser link target",
+    to: "/settings/integrations",
+    searchTerms: ["open links in external links"],
+  },
+  { id: "environment-icon", title: "Environment icon", to: "/settings/connections" },
+  { id: "load-balancing", title: "Load balancing", to: "/settings/general" },
+  { id: "project-defaults", title: "Project defaults", to: "/settings/general" },
+  {
+    id: "panel-animations",
+    title: "Panel animations",
+    to: "/settings/appearance",
   },
   {
     id: "color-scheme",
@@ -105,11 +113,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Glass opacity",
     to: "/settings/appearance",
     searchTerms: ["transparent transparency solid menus dialogs composer"],
-  },
-  {
-    id: "panel-animations",
-    title: "Panel animations",
-    to: "/settings/appearance",
   },
   {
     id: "environment-identification",
@@ -157,6 +160,11 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["long lines code blocks tables diffs file previews"],
   },
   {
+    id: "composer-context",
+    title: "Composer context",
+    to: "/settings/appearance",
+  },
+  {
     id: "project-grouping",
     title: "Project grouping",
     to: "/settings/general",
@@ -181,8 +189,8 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Days of inactivity before auto-settle",
     to: "/settings/general",
     targetId: "auto-settle-inactive-threads",
-    searchTerms: ["thread timeout activity sidebar"],
     requiresThreadAutoSettlement: true,
+    searchTerms: ["thread timeout activity sidebar"],
   },
   {
     id: "time-format",
@@ -197,28 +205,10 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["diff ignore spaces edits default"],
   },
   {
-    id: "diff-layout",
-    title: "Diff layout",
-    to: "/settings/general",
-    searchTerms: ["stacked split side by side unified inline view"],
-  },
-  {
-    id: "proactive-panels",
-    title: "Proactive panels",
-    to: "/settings/general",
-    searchTerms: ["automatically open diff pull request pr right panel agent completion"],
-  },
-  {
     id: "skills-in-slash-menu",
     title: "Show skills in slash menu",
     to: "/settings/general",
     searchTerms: ["command menu dollar $ slash /"],
-  },
-  {
-    id: "composer-collapse",
-    title: "Collapse composer on scroll",
-    to: "/settings/general",
-    searchTerms: ["composer rest resting scroll wheel conversation timeline shrink minimize"],
   },
   {
     id: "provider-update-checks",
@@ -245,13 +235,14 @@ export const SETTINGS_SEARCH_ITEMS = [
   {
     id: "new-threads",
     title: "New threads",
-    to: "/settings/projects",
+    to: "/settings/general",
     searchTerms: ["default workspace mode draft local worktree"],
   },
   {
     id: "start-from-origin",
     title: "Start from origin",
     to: "/settings/general",
+    targetId: "new-threads",
     searchTerms: ["new worktrees latest matching remote branch local"],
   },
   {
@@ -282,7 +273,7 @@ export const SETTINGS_SEARCH_ITEMS = [
     id: "quit-confirmation",
     title: "Quit shortcut",
     to: "/settings/general",
-    searchTerms: ["confirmation desktop app exit direct hold double click press twice"],
+    searchTerms: ["confirmation shortcut desktop app exit"],
     desktopOnly: true,
   },
   {
@@ -371,8 +362,21 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Providers",
     to: "/settings/providers",
     searchTerms: [
-      "agents cli codex claude cursor grok opencode antigravity google sign in sign out install subscription instances authentication api key models configuration binary path config directory endpoint arguments environment variables display name accent color custom favorite hidden auto compact",
+      "agents cli codex claude cursor grok opencode antigravity google sign in instances authentication api key models configuration binary path config directory endpoint arguments environment variables display name accent color custom favorite hidden auto compact",
     ],
+  },
+  {
+    id: "browser-profiles",
+    title: "Browser profiles",
+    to: "/settings/integrations",
+    searchTerms: ["default profile browser recording session"],
+  },
+  {
+    id: "browser-default-profile",
+    title: "Default browser profile",
+    to: "/settings/integrations",
+    targetId: "browser-profiles",
+    searchTerms: ["browser profile default"],
   },
   {
     id: "usage-providers",
@@ -393,20 +397,8 @@ export const SETTINGS_SEARCH_ITEMS = [
   {
     id: "agent-browser-access",
     title: "Agent browser access",
-    to: "/settings/projects",
+    to: "/settings/integrations",
     searchTerms: ["allow open drive preview tools sessions"],
-  },
-  {
-    id: "browser-profiles",
-    title: "Browser profiles",
-    to: "/settings/integrations",
-    targetId: "browser",
-  },
-  {
-    id: "browser-default-profile",
-    title: "Default browser profile",
-    to: "/settings/integrations",
-    targetId: "browser-profiles",
   },
   {
     id: "browser-default-viewport",
@@ -430,12 +422,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     id: "browser-recording-frame-rate",
     title: "Browser recording frame rate",
     to: "/settings/integrations",
-  },
-  {
-    id: "browser-link-target",
-    title: "Open links in",
-    to: "/settings/integrations",
-    searchTerms: ["links default browser in-app browser external open"],
   },
   {
     id: "browser-auto-show-floating-preview",
@@ -484,14 +470,6 @@ export const SETTINGS_SEARCH_ITEMS = [
       "override generated commit change request pr titles descriptions branch bookmark",
     ],
     primaryOnly: true,
-  },
-  {
-    id: "environment-icon",
-    title: "Environment icon",
-    to: "/settings/connections",
-    targetId: "connections-environment",
-    searchTerms: ["machine glyph sidebar mac mini studio laptop desktop server cloud vm"],
-    localBackendManagementOnly: true,
   },
   {
     id: "network-access",
@@ -554,14 +532,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["add pair backend host code ssh config agent tunnel saved t3 connect"],
   },
   {
-    id: "load-balancing",
-    title: "Load balancing",
-    to: "/settings/connections",
-    searchTerms: [
-      "automatic machine environment resources cpu memory capacity preference weight shared projects",
-    ],
-  },
-  {
     id: "archive",
     title: "Archived threads",
     to: "/settings/archived",
@@ -569,9 +539,11 @@ export const SETTINGS_SEARCH_ITEMS = [
   },
 ] as const satisfies ReadonlyArray<SettingsSearchItem>;
 
-export type SettingsSearchItemId = (typeof SETTINGS_SEARCH_ITEMS)[number]["id"];
+export type SettingsSearchItemId = string;
 
-const SEARCH_ITEMS_BY_ID = new Map(SETTINGS_SEARCH_ITEMS.map((item) => [item.id, item] as const));
+const SEARCH_ITEMS_BY_ID: ReadonlyMap<string, SettingsSearchItem> = new Map(
+  SETTINGS_SEARCH_ITEMS.map((item) => [item.id, item] as const),
+);
 
 /**
  * `id` and `title` props for the element a search item anchors to. Panels
@@ -582,8 +554,8 @@ export function searchableSetting(id: SettingsSearchItemId): {
   readonly id: string;
   readonly title: string;
 } {
-  const { id: anchorId, title } = SEARCH_ITEMS_BY_ID.get(id)!;
-  return { id: anchorId, title };
+  const item = SEARCH_ITEMS_BY_ID.get(id);
+  return item ? { id: item.id, title: item.title } : { id, title: id };
 }
 
 export function filterAvailableSettingsSearchItems(
@@ -597,7 +569,7 @@ export function filterAvailableSettingsSearchItems(
       (!item.providerSettingsOnly || availability.hasProviderSettingsEnvironment) &&
       (!item.localBackendManagementOnly || availability.canManageLocalBackend) &&
       (!item.wslAvailableOnly || availability.isWslSettingsRowVisible) &&
-      (!item.requiresThreadAutoSettlement || availability.hasThreadAutoSettlement),
+      (item.requiresThreadAutoSettlement === undefined || availability.hasThreadAutoSettlement),
   );
 }
 

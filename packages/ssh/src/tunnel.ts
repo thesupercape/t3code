@@ -405,6 +405,24 @@ ensure_remote_node_path() {
 const REMOTE_RUNNER_SCRIPT = `#!/bin/sh
 set -eu
 @@T3_NODE_ENV_SCRIPT@@
+
+# SSH remote commands start a non-interactive shell, so they normally miss the
+# user's Terminal environment (for example Homebrew paths, MCP credentials, and
+# plugin executables configured in .zprofile/.zshrc). Re-enter the runner once
+# through the supported login shell so the T3 backend and every provider it
+# spawns observe the same environment as an interactive Codex session.
+if [ "\${T3CODE_REMOTE_LOGIN_SHELL_LOADED:-0}" != "1" ]; then
+  case "\${SHELL:-}" in
+    */zsh|*/bash|*/sh|*/ksh)
+      T3CODE_REMOTE_LOGIN_SHELL_LOADED=1
+      T3CODE_REMOTE_RUNNER_PATH="$0"
+      export T3CODE_REMOTE_LOGIN_SHELL_LOADED T3CODE_REMOTE_RUNNER_PATH
+      exec "$SHELL" -lic 'exec "$T3CODE_REMOTE_RUNNER_PATH" "$@"' t3-code-remote "$@"
+      ;;
+  esac
+fi
+unset T3CODE_REMOTE_LOGIN_SHELL_LOADED T3CODE_REMOTE_RUNNER_PATH
+
 ensure_remote_node_path || true
 T3_NODE_SCRIPT_PATH=@@T3_NODE_SCRIPT_PATH@@
 if [ -n "$T3_NODE_SCRIPT_PATH" ]; then

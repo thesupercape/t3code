@@ -38,6 +38,10 @@ export const CLI_RUNTIME_EXTERNAL_PREFIXES = [
   // Required by node-gyp-build-optional-packages. Not native, but in the
   // closure: without it, WSL gets MODULE_NOT_FOUND while Windows is fine.
   "detect-libc",
+  // Playwright's core bundle contains CommonJS modules that resolve package
+  // resources (including browsers.json) through their own __dirname. Keep it
+  // external so those paths remain correct in the server's ESM bundle.
+  "playwright-core",
   // ws's optional accelerators. Nothing in this repo declares them, so they are
   // not in the staged production install and the packaged app does not ship
   // them either way -- ws wraps the require in try/catch and falls back to its

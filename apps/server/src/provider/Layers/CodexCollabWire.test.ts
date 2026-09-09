@@ -130,7 +130,7 @@ describe("routeCodexChildNotification", () => {
     }
   });
 
-  it("drops only enumerated child chatter", () => {
+  it("preserves child streaming and metadata as child events", () => {
     for (const method of [
       "item/agentMessage/delta",
       "item/reasoning/textDelta",
@@ -138,7 +138,7 @@ describe("routeCodexChildNotification", () => {
       "turn/plan/updated",
       "thread/name/updated",
     ]) {
-      assert.equal(routeCodexChildNotification(method), "drop", method);
+      assert.equal(routeCodexChildNotification(method), "agent-event", method);
     }
   });
 

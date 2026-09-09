@@ -10,7 +10,9 @@ import { CodexSettings } from "@t3tools/contracts";
 import {
   CodexShadowHomeEntryConflictError,
   CodexShadowHomePathConflictError,
+  migrateCodexResumeRollout,
   materializeCodexShadowHome,
+  codexIsolatedHomePath,
   resolveCodexHomeLayout,
 } from "./CodexHomeLayout.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
@@ -82,6 +84,27 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
         });
       }),
     );
+
+    it.effect("derives an isolated home while retaining the shared continuation identity", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+        const t3Home = yield* makeTempDir("t3code-t3-home-");
+        const isolatedHome = codexIsolatedHomePath(path, t3Home, "codex");
+
+        const layout = yield* resolveCodexHomeLayout(
+          decodeCodexSettings({ homePath: sharedHome }),
+          { isolatedHomePath: isolatedHome },
+        );
+
+        expect(layout).toMatchObject({
+          mode: "isolated",
+          sharedHomePath: sharedHome,
+          effectiveHomePath: isolatedHome,
+          continuationKey: `codex:home:${sharedHome}`,
+        });
+      }),
+    );
   });
 
   describe("materializeCodexShadowHome", () => {
@@ -138,6 +161,74 @@ it.layer(NodeServices.layer)("CodexHomeLayout", (it) => {
           expect(authLinkResult._tag).toBe("Failure");
           expect(authContents).toContain("shadow");
         }),
+    );
+
+    it.effect.skipIf(!symlinksSupported)("links only account assets for an isolated home", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+        const isolatedRoot = yield* makeTempDir("t3code-codex-isolated-root-");
+        const isolatedHome = path.join(isolatedRoot, "codex");
+        yield* writeTextFile(path.join(sharedHome, "auth.json"), '{"account":true}\n');
+        yield* writeTextFile(path.join(sharedHome, "config.toml"), 'model = "gpt-5-codex"\n');
+        yield* fileSystem.makeDirectory(path.join(sharedHome, "plugins"));
+        yield* fileSystem.makeDirectory(path.join(sharedHome, "skills"));
+        yield* fileSystem.makeDirectory(path.join(sharedHome, "sessions"));
+        yield* fileSystem.makeDirectory(path.join(sharedHome, "sqlite"));
+
+        const layout = yield* resolveCodexHomeLayout(
+          decodeCodexSettings({ homePath: sharedHome }),
+          { isolatedHomePath: isolatedHome },
+        );
+        yield* materializeCodexShadowHome(layout);
+
+        expect(yield* fileSystem.readFileString(path.join(isolatedHome, "auth.json"))).toContain(
+          '"account":true',
+        );
+        expect(yield* fileSystem.readFileString(path.join(isolatedHome, "config.toml"))).toContain(
+          "gpt-5-codex",
+        );
+        expect(yield* fileSystem.readLink(path.join(isolatedHome, "plugins"))).toBe(
+          path.join(sharedHome, "plugins"),
+        );
+        expect(yield* fileSystem.exists(path.join(isolatedHome, "sessions"))).toBe(false);
+        expect(yield* fileSystem.exists(path.join(isolatedHome, "sqlite"))).toBe(false);
+      }),
+    );
+
+    it.effect("copies only the exact legacy rollout without deleting its source", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedHome = yield* makeTempDir("t3code-codex-shared-");
+        const isolatedHome = yield* makeTempDir("t3code-codex-isolated-");
+        const threadId = "019e487f-1234-7abc-8def-0123456789ab";
+        const source = path.join(
+          sharedHome,
+          "sessions",
+          "2026",
+          "09",
+          `rollout-2026-09-07T00-00-00-${threadId}.jsonl`,
+        );
+        yield* writeTextFile(source, '{"session_meta":{"id":"test"}}\n');
+
+        yield* migrateCodexResumeRollout({
+          sharedHomePath: sharedHome,
+          effectiveHomePath: isolatedHome,
+          resumeThreadId: threadId,
+        });
+
+        const destination = path.join(
+          isolatedHome,
+          "sessions",
+          "2026",
+          "09",
+          `rollout-2026-09-07T00-00-00-${threadId}.jsonl`,
+        );
+        expect(yield* fileSystem.readFileString(destination)).toContain('"session_meta"');
+        expect(yield* fileSystem.readFileString(source)).toContain('"session_meta"');
+      }),
     );
 
     it.effect.skipIf(!symlinksSupported)(

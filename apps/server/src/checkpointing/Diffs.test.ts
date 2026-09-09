@@ -1,6 +1,32 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { parseTurnDiffFilesFromNumstat } from "./Diffs.ts";
+import { parseTurnDiffFilesFromNumstat, parseTurnDiffFilesFromUnifiedDiff } from "./Diffs.ts";
+
+describe("parseTurnDiffFilesFromUnifiedDiff", () => {
+  it("counts changed lines and retains rename destinations", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "similarity index 90%",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+      "@@ -1,1 +1,2 @@",
+      "-old",
+      "+new",
+      "+line",
+    ].join("\n");
+    expect(parseTurnDiffFilesFromUnifiedDiff(diff)).toEqual([
+      { path: "src/new.ts", additions: 2, deletions: 1 },
+    ]);
+  });
+
+  it("returns zero counts for metadata-only renames", () => {
+    expect(
+      parseTurnDiffFilesFromUnifiedDiff(
+        "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n",
+      ),
+    ).toEqual([{ path: "new.txt", additions: 0, deletions: 0 }]);
+  });
+});
 
 describe("parseTurnDiffFilesFromNumstat", () => {
   it("returns an empty list when no files changed", () => {

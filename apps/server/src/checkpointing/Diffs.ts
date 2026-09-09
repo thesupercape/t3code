@@ -4,6 +4,56 @@ export interface TurnDiffFileSummary {
   readonly deletions: number;
 }
 
+/** Parse Git's unified patch output without depending on a renderer parser. */
+export function parseTurnDiffFilesFromUnifiedDiff(
+  diff: string,
+): ReadonlyArray<TurnDiffFileSummary> {
+  const lines = diff.replace(/\r\n/g, "\n").split("\n");
+  const files: TurnDiffFileSummary[] = [];
+  let current: TurnDiffFileSummary | undefined;
+  let additions = 0;
+  let deletions = 0;
+  let sawHunk = false;
+
+  const finish = () => {
+    if (current !== undefined) {
+      files.push({ ...current, additions, deletions });
+    }
+    current = undefined;
+    additions = 0;
+    deletions = 0;
+    sawHunk = false;
+  };
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      finish();
+      const path = line.slice("diff --git ".length).split(" ").at(-1)?.replace(/^b\//, "");
+      current = path === undefined ? undefined : { path, additions: 0, deletions: 0 };
+      continue;
+    }
+    if (current === undefined) continue;
+    if (line.startsWith("rename to ")) {
+      current = { ...current, path: line.slice("rename to ".length) };
+      continue;
+    }
+    if (line.startsWith("+++ ") && !sawHunk) {
+      const path = line.slice(4).replace(/^b\//, "");
+      if (path !== "/dev/null") current = { ...current, path };
+      continue;
+    }
+    if (line.startsWith("@@ ")) {
+      sawHunk = true;
+      continue;
+    }
+    if (!sawHunk || line.startsWith("\\")) continue;
+    if (line.startsWith("+")) additions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  finish();
+  return files.toSorted((left, right) => left.path.localeCompare(right.path));
+}
+
 /** Reads Git's NUL-delimited numstat output without decoding display paths. */
 export function parseTurnDiffFilesFromNumstat(numstat: string): ReadonlyArray<TurnDiffFileSummary> {
   const records = numstat.split("\0");

@@ -14,6 +14,21 @@ const rates: RateTable = new Map([
       cacheCreationCostPerToken: 1.25e-5,
     },
   ],
+  [
+    "gpt-long-context",
+    {
+      inputCostPerToken: 1e-6,
+      outputCostPerToken: 2e-6,
+      cacheReadCostPerToken: 0.1e-6,
+      cacheCreationCostPerToken: 1.25e-6,
+      above272kTokens: {
+        inputCostPerToken: 2e-6,
+        outputCostPerToken: 3e-6,
+        cacheReadCostPerToken: 0.2e-6,
+        cacheCreationCostPerToken: 2.5e-6,
+      },
+    },
+  ],
 ]);
 
 function record(overrides: Partial<UsageRecord> = {}): UsageRecord {
@@ -102,6 +117,28 @@ describe("UsageAggregator", () => {
     expect(losAngeles.buckets[0]?.day).toBe("2026-08-06");
   });
 
+  it("keeps exact local-day boundaries in offset time zones", () => {
+    const aggregator = new UsageAggregator({
+      timeZone: "Asia/Kathmandu",
+      sinceDay: "2026-08-01",
+      untilDay: "2026-08-01",
+      rates,
+    });
+    for (const timestamp of [
+      "2026-07-31T18:14:59.999Z",
+      "2026-07-31T18:15:00.000Z",
+      "2026-08-01T18:14:59.999Z",
+      "2026-08-01T18:15:00.000Z",
+    ]) {
+      aggregator.add(record({ timestampMs: Date.parse(timestamp) }));
+    }
+
+    const result = aggregator.finish();
+    expect(result.outOfWindow).toBe(2);
+    expect(result.buckets[0]?.day).toBe("2026-08-01");
+    expect(result.buckets[0]?.records).toBe(2);
+  });
+
   it("splits an hourly request into fixed buckets anchored to its exact start", () => {
     const result = aggregate(
       [
@@ -154,6 +191,23 @@ describe("UsageAggregator", () => {
     // 100*1e-5 + 1000*1e-6 + 10*1.25e-5 + 50*5e-5
     expect(result.buckets[0]?.costUsd).toBeCloseTo(0.004625, 9);
     expect(result.buckets[0]?.costSource).toBe("modelPriced");
+  });
+
+  it("uses the long-context rates for a request above 272K input tokens", () => {
+    const result = aggregate([
+      record({
+        model: "gpt-long-context",
+        totals: {
+          uncachedInputTokens: 200_001,
+          cachedInputTokens: 72_000,
+          cacheCreationTokens: 0,
+          outputTokens: 1_000,
+          reasoningTokens: 500,
+        },
+      }),
+    ]);
+
+    expect(result.buckets[0]?.costUsd).toBeCloseTo(0.400_002 + 0.014_4 + 0.003, 9);
   });
 
   it("counts tokens but not cost for a model with no rate", () => {

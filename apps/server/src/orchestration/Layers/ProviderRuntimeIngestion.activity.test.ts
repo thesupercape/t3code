@@ -16,6 +16,119 @@ const base = {
 };
 
 describe("runtimeEventToActivities task progress", () => {
+  it.each(["item.started", "item.updated", "item.completed"] as const)(
+    "persists compact screenshot metadata for %s",
+    (type) => {
+      const screenshot = {
+        threadId: base.threadId,
+        attachmentId: "thread-1-12345678-1234-1234-1234-123456789abc",
+        mimeType: "image/png",
+        width: 1280,
+        height: 720,
+      };
+      const activities = runtimeEventToActivities({
+        ...base,
+        eventId: EventId.make("screenshot"),
+        type,
+        payload: {
+          itemType: "mcp_tool_call",
+          data: {
+            item: {
+              tool: "computer_screenshot",
+              result: {
+                structuredContent: { screenshot },
+                content: [{ type: "image", data: "large-image-bytes".repeat(100_000) }],
+              },
+            },
+          },
+        },
+      });
+      expect(activities[0]?.payload).toMatchObject({ data: { item: { result: { screenshot } } } });
+      expect(JSON.stringify(activities).length).toBeLessThan(1024);
+    },
+  );
+
+  it("drops screenshot pointers belonging to a different thread before persistence", () => {
+    const activities = runtimeEventToActivities({
+      ...base,
+      eventId: EventId.make("screenshot"),
+      type: "item.completed",
+      payload: {
+        itemType: "mcp_tool_call",
+        data: {
+          item: {
+            tool: "computer_screenshot",
+            result: {
+              screenshot: {
+                threadId: "thread-2",
+                attachmentId: "thread-2-12345678-1234-1234-1234-123456789abc",
+                mimeType: "image/png",
+                width: 1,
+                height: 1,
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(activities[0]?.payload).not.toHaveProperty("data.item.result.screenshot");
+  });
+  it("retains Codex child identity on every persisted lifecycle snapshot", () => {
+    const taskId = RuntimeTaskId.make("codex-child");
+    const providerRefs = {
+      providerThreadId: "codex-child",
+      providerTurnId: "codex-child-turn",
+    };
+    const linkage = { taskId, parentAgentId: "codex-parent", timelineBypass: true };
+    const events: ReadonlyArray<ProviderRuntimeEvent> = [
+      {
+        ...base,
+        providerRefs,
+        eventId: EventId.make("start"),
+        type: "task.started",
+        payload: { ...linkage, description: "Inspect browser", taskType: "agent" },
+      },
+      {
+        ...base,
+        providerRefs,
+        eventId: EventId.make("progress"),
+        type: "task.progress",
+        payload: {
+          ...linkage,
+          description: "Inspect browser",
+          summary: "Running a check",
+          typedUsage: { totalTokens: 12 },
+        },
+      },
+      {
+        ...base,
+        providerRefs,
+        eventId: EventId.make("update"),
+        type: "task.updated",
+        payload: { ...linkage, status: "waiting" },
+      },
+      {
+        ...base,
+        providerRefs,
+        eventId: EventId.make("complete"),
+        type: "task.completed",
+        payload: { ...linkage, status: "completed", summary: "Check passed" },
+      },
+    ];
+
+    for (const event of events) {
+      const activities = runtimeEventToActivities(event);
+      expect(activities.length).toBeGreaterThan(0);
+      for (const activity of activities) {
+        expect(activity.payload).toMatchObject({
+          taskId: "codex-child",
+          parentAgentId: "codex-parent",
+          providerRefs,
+        });
+      }
+    }
+  });
+
   it("persists usage independently from replaceable activity", () => {
     const taskId = RuntimeTaskId.make("agent-1");
     const usageOnly = {

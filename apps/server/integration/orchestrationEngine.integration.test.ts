@@ -871,7 +871,7 @@ it.live("reverts to an earlier checkpoint and trims checkpoint projections + git
       );
       assert.equal(
         NodeFS.readFileSync(NodePath.join(harness.workspaceDir, "README.md"), "utf8"),
-        "v2\n",
+        `v2${process.platform === "win32" ? "\r\n" : "\n"}`,
       );
       assert.equal(
         gitRefExists(harness.workspaceDir, checkpointRefForThreadTurn(THREAD_ID, 2)),

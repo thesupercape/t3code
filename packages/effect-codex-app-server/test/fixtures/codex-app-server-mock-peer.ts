@@ -39,6 +39,11 @@ const handleMethod = (message: Record<string, unknown>) => {
       // oxlint-disable-next-line t3code/no-global-process-runtime -- Standalone mock peer process has no Effect runtime.
       const platform = NodeOS.platform();
       const stderrBytes = Number(process.env.CODEX_APP_SERVER_TEST_STDERR_BYTES ?? 0);
+      const exitStderr = process.env.CODEX_APP_SERVER_TEST_EXIT_STDERR;
+      if (exitStderr !== undefined) {
+        process.stderr.write(exitStderr, () => process.exit(1));
+        return;
+      }
       if (Number.isFinite(stderrBytes) && stderrBytes > 0) {
         process.stderr.write("x".repeat(stderrBytes), () => {
           respond(message.id as number | string, {

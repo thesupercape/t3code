@@ -11,6 +11,7 @@ import {
   type ArchiveThreadInput,
   type CreateThreadInput,
   type DeleteThreadInput,
+  type EditThreadFromHereInput,
   type InterruptThreadTurnInput,
   type RespondToThreadApprovalInput,
   type RespondToThreadUserInputInput,
@@ -24,6 +25,7 @@ import {
   type SettleThreadInput,
   type SnoozeThreadInput,
   type StartThreadTurnInput,
+  type SteerThreadTurnInput,
   type StopThreadSessionInput,
   type UnarchiveThreadInput,
   type UnpinThreadInput,
@@ -33,6 +35,7 @@ import {
   archiveThread,
   createThread,
   deleteThread,
+  editThreadFromHere,
   interruptThreadTurn,
   respondToThreadApproval,
   respondToThreadUserInput,
@@ -46,6 +49,7 @@ import {
   settleThread,
   snoozeThread,
   startThreadTurn,
+  steerThreadTurn,
   stopThreadSession,
   unarchiveThread,
   unpinThread,
@@ -59,6 +63,7 @@ export type {
   ArchiveThreadInput,
   CreateThreadInput,
   DeleteThreadInput,
+  EditThreadFromHereInput,
   InterruptThreadTurnInput,
   RespondToThreadApprovalInput,
   RespondToThreadUserInputInput,
@@ -72,6 +77,7 @@ export type {
   SettleThreadInput,
   SnoozeThreadInput,
   StartThreadTurnInput,
+  SteerThreadTurnInput,
   StopThreadSessionInput,
   UnarchiveThreadInput,
   UnpinThreadInput,
@@ -86,8 +92,13 @@ export function createThreadEnvironmentAtoms<R, E>(
   const scheduler = createAtomCommandScheduler();
   const concurrency = {
     mode: "serial" as const,
-    key: ({ environmentId, input }: { environmentId: string; input: { threadId: string } }) =>
-      JSON.stringify([environmentId, input.threadId]),
+    key: ({ environmentId, input }: { environmentId: string; input: unknown }) => {
+      const threadId =
+        typeof input === "object" && input !== null && "threadId" in input
+          ? String(input.threadId)
+          : "";
+      return JSON.stringify([environmentId, threadId]);
+    },
   };
   return {
     create: createEnvironmentCommand(runtime, {
@@ -192,6 +203,12 @@ export function createThreadEnvironmentAtoms<R, E>(
       scheduler,
       concurrency,
     }),
+    steerTurn: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:steer-turn",
+      execute: (input: SteerThreadTurnInput) => steerThreadTurn(input),
+      scheduler,
+      concurrency,
+    }),
     respondToApproval: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:respond-to-approval",
       execute: (input: RespondToThreadApprovalInput) => respondToThreadApproval(input),
@@ -213,6 +230,12 @@ export function createThreadEnvironmentAtoms<R, E>(
     revertCheckpoint: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:thread:revert-checkpoint",
       execute: (input: RevertThreadCheckpointInput) => revertThreadCheckpoint(input),
+      scheduler,
+      concurrency,
+    }),
+    editFromHere: createEnvironmentCommand(runtime, {
+      label: "environment-data:commands:thread:edit-from-here",
+      execute: (input: EditThreadFromHereInput) => editThreadFromHere(input),
       scheduler,
       concurrency,
     }),

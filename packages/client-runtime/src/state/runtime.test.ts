@@ -660,6 +660,41 @@ describe("Atom.fn mutation semantics", () => {
 });
 
 describe("executeAtomQuery", () => {
+  it("revalidates cached data and joins repeated refreshes", async () => {
+    let reads = 0;
+    const latch = Latch.makeUnsafe();
+    const query = Atom.make(
+      Effect.suspend(() => {
+        reads++;
+        return reads === 1 ? Effect.succeed("saved") : latch.await.pipe(Effect.as("fresh"));
+      }),
+    );
+    const registry = AtomRegistry.make();
+    const unmount = registry.mount(query);
+    expect((await executeAtomQuery(registry, query))._tag).toBe("Success");
+    const first = executeAtomQuery(registry, query, { refresh: true });
+    const second = executeAtomQuery(registry, query, { refresh: true });
+    expect(registry.get(query).waiting).toBe(true);
+    latch.openUnsafe();
+    const results = await Promise.all([first, second]);
+    expect(results.map((result) => result._tag === "Success" && result.value)).toEqual([
+      "fresh",
+      "fresh",
+    ]);
+    expect(reads).toBe(2);
+    unmount();
+    registry.dispose();
+  });
+  it("returns a failure when a disconnected query exceeds the refresh deadline", async () => {
+    const registry = AtomRegistry.make();
+    const result = await executeAtomQuery(registry, Atom.make(Effect.never), {
+      refresh: true,
+      timeoutMs: 0,
+      reportDefect: false,
+    });
+    expect(result._tag).toBe("Failure");
+    registry.dispose();
+  });
   it("keeps concurrent query results correlated to their atoms", async () => {
     const firstLatch = Latch.makeUnsafe();
     const secondLatch = Latch.makeUnsafe();

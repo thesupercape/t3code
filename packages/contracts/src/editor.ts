@@ -182,6 +182,17 @@ export class ExternalLauncherBrowserSpawnError extends Schema.TaggedError<Extern
   }
 }
 
+export class ExternalLauncherBrowserNotFoundError extends Schema.TaggedError<ExternalLauncherBrowserNotFoundError>()(
+  "ExternalLauncherBrowserNotFoundError",
+  {
+    browser: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Browser executable not found: ${this.browser}`;
+  }
+}
+
 export class ExternalLauncherEditorSpawnError extends Schema.TaggedError<ExternalLauncherEditorSpawnError>()(
   "ExternalLauncherEditorSpawnError",
   {
@@ -200,6 +211,7 @@ export const ExternalLauncherError = Schema.Union([
   ExternalLauncherUnsupportedEditorError,
   ExternalLauncherCommandNotFoundError,
   ExternalLauncherBrowserSpawnError,
+  ExternalLauncherBrowserNotFoundError,
   ExternalLauncherEditorSpawnError,
 ]);
 export type ExternalLauncherError = typeof ExternalLauncherError.Type;

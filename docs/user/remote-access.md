@@ -186,3 +186,16 @@ Include the diagnostic message and trace ID when reporting a persistent failure.
 
 For a connection that still fails after linking, check the date and time on both
 devices. For server version warnings, follow [Updating T3 Code](./updating.md).
+
+### Install the web app on a phone
+
+When you open T3 Code over HTTPS, your browser can install it on the home screen as a standalone
+web app. The installed app caches its interface and recent environment and thread snapshots, so you
+can reopen previously loaded conversations while the server or network is unavailable. Sending
+messages and other server actions remain unavailable until the environment reconnects.
+
+Browser task notifications are available under **Settings** → **General**. They cover approval
+requests, agent questions, completed tasks, and failed tasks while T3 Code remains open in the
+background. Tapping one opens its thread. These browser notifications do not use T3 Connect push
+delivery, so a browser that has fully stopped the installed app cannot receive them. The native
+mobile app remains the option for push delivery when no web client is running.

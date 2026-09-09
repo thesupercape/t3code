@@ -93,8 +93,8 @@ interface FilePreviewPanelProps {
   revealRequestId: number;
   onOpenFile: (relativePath: string) => void;
   onPendingChange: (relativePath: string, pending: boolean) => void;
-  selectedFilePending: boolean;
-  workspaceMutationId: string | null;
+  selectedFilePending?: boolean;
+  workspaceMutationId?: string | null;
 }
 
 const FILE_EXPLORER_STORAGE_KEY = "t3code.fileExplorerOpen";
@@ -966,8 +966,8 @@ export default function FilePreviewPanel({
   revealRequestId,
   onOpenFile,
   onPendingChange,
-  selectedFilePending,
-  workspaceMutationId,
+  selectedFilePending = false,
+  workspaceMutationId = null,
 }: FilePreviewPanelProps) {
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);

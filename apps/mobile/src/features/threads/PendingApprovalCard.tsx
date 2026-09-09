@@ -30,20 +30,22 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
   // Opaque for the same reason as PendingUserInputCard: nothing blurs the feed
   // behind this card, so a translucent surface bleeds messages through it.
   return (
-    <View className="gap-2.5 rounded-[20px] border border-border bg-card-alt p-4">
-      <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
+    <View className="gap-2.5 rounded-[20px] border border-adaptive-neutral-200-white-a6 bg-adaptive-neutral-100-900 p-4">
+      <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-adaptive-sky-700-300">
         Approval needed
       </Text>
-      <Text className="font-t3-bold text-lg text-foreground">
+      <Text className="font-t3-bold text-lg text-adaptive-neutral-950-50">
         {props.approval.appName ?? props.approval.requestKind}
       </Text>
       {props.approval.detail ? (
-        <Text className="font-sans text-sm leading-normal text-foreground-secondary">
+        <Text className="font-sans text-sm leading-normal text-adaptive-neutral-600-400">
           {props.approval.detail}
         </Text>
       ) : null}
       {warning ? (
-        <Text className="font-sans text-xs leading-normal text-warning-foreground">{warning}</Text>
+        <Text className="font-sans text-xs leading-normal text-adaptive-amber-700-300">
+          {warning}
+        </Text>
       ) : null}
       <View className="flex-row flex-wrap gap-2.5">
         {options.map((option) => (
@@ -51,10 +53,10 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
             key={option.decision}
             className={`items-center justify-center rounded-[14px] px-3.5 py-3 ${
               option.decision === "accept"
-                ? "bg-primary"
+                ? "bg-blue-500"
                 : option.decision === "decline"
-                  ? "bg-danger"
-                  : "bg-subtle-strong"
+                  ? "bg-adaptive-rose-100-500-a18"
+                  : "bg-adaptive-neutral-200-800"
             }`}
             disabled={props.respondingApprovalId === props.approval.requestId}
             onPress={() => void props.onRespond(props.approval.requestId, option.decision)}
@@ -62,10 +64,10 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
             <Text
               className={`text-sm ${
                 option.decision === "accept"
-                  ? "font-t3-extrabold text-primary-foreground"
+                  ? "font-t3-extrabold text-white"
                   : option.decision === "decline"
-                    ? "font-t3-bold text-danger-foreground"
-                    : "font-t3-bold text-foreground"
+                    ? "font-t3-bold text-adaptive-rose-700-300"
+                    : "font-t3-bold text-adaptive-neutral-950-50"
               }`}
             >
               {option.label}

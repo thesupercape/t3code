@@ -3,6 +3,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
@@ -10,6 +11,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 
 import * as CodexClient from "./client.ts";
+import * as CodexErrors from "./errors.ts";
+import { CODEX_APP_SERVER_STDERR_MAX_CHARS } from "./_internal/diagnostics.ts";
 
 const mockPeerPath = Effect.map(Effect.service(Path.Path), (path) =>
   path.join(import.meta.dirname, "../test/fixtures/codex-app-server-mock-peer.ts"),
@@ -152,6 +155,46 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       );
 
       assert.equal(initialized.userAgent, "mock-codex-app-server");
+    }),
+  );
+
+  it.effect("keeps bounded sanitized stderr when the child exits during a request", () =>
+    Effect.gen(function* () {
+      const secret = "secret-value-from-child";
+      const handle = yield* makeHandle({
+        CODEX_APP_SERVER_TEST_EXIT_STDERR: `setup error api_key=${secret}\n${"x".repeat(9_000)}`,
+      });
+      const scope = yield* Scope.make();
+      const clientLayer = CodexClient.layerChildProcess(handle);
+      const context = yield* Layer.buildWithScope(clientLayer, scope);
+
+      const error = yield* Effect.gen(function* () {
+        const client = yield* CodexClient.CodexAppServerClient;
+        return yield* client
+          .request("initialize", {
+            clientInfo: {
+              name: "effect-codex-app-server-test",
+              title: "Effect Codex App Server Test",
+              version: "0.0.0",
+            },
+            capabilities: {
+              experimentalApi: true,
+              optOutNotificationMethods: null,
+            },
+          })
+          .pipe(Effect.flip);
+      }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
+
+      const isProcessExited = Schema.is(CodexErrors.CodexAppServerProcessExitedError);
+      assert.equal(isProcessExited(error), true);
+      if (!isProcessExited(error)) return;
+      const processError = error;
+      assert.equal(processError.method, "initialize");
+      assert.equal(processError.requestId, "1");
+      assert.equal(processError.stderrTruncated, true);
+      assert.equal(processError.stderr?.length, CODEX_APP_SERVER_STDERR_MAX_CHARS);
+      assert.notInclude(processError.message, secret);
+      assert.include(processError.message, "api_key=[REDACTED]");
     }),
   );
 });

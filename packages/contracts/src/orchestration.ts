@@ -3,7 +3,7 @@ import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as SchemaTransformation from "effect/SchemaTransformation";
 import * as Struct from "effect/Struct";
-import { ProviderOptionSelections } from "./model.ts";
+import { ProviderOptionSelections, SubagentBackend } from "./model.ts";
 import { RepositoryIdentity, ThreadEnvMode } from "./environment.ts";
 import {
   ApprovalRequestId,
@@ -133,6 +133,8 @@ export const ProviderRequestKind = Schema.Literals([
   "file-read",
   "file-change",
   "mcp-elicitation",
+  "permissions",
+  "tool",
 ]);
 export type ProviderRequestKind = typeof ProviderRequestKind.Type;
 export const AssistantDeliveryMode = Schema.Literals(["buffered", "streaming"]);
@@ -599,6 +601,23 @@ export const ThreadTitleRegeneration = Schema.Struct({
 });
 export type ThreadTitleRegeneration = typeof ThreadTitleRegeneration.Type;
 
+export const ThreadWorkspaceRestoreOutcome = Schema.Struct({
+  filesRestored: Schema.Boolean,
+  reason: Schema.optional(TrimmedNonEmptyString),
+  conversationOnly: Schema.optional(Schema.Boolean),
+  detail: Schema.optional(TrimmedNonEmptyString),
+});
+export type ThreadWorkspaceRestoreOutcome = typeof ThreadWorkspaceRestoreOutcome.Type;
+
+export const ThreadEditFromHereFinishedPayload = Schema.Struct({
+  threadId: ThreadId,
+  requestId: CommandId,
+  targetThreadId: Schema.optional(ThreadId),
+  error: Schema.optional(TrimmedNonEmptyString),
+  workspaceRestore: Schema.optional(ThreadWorkspaceRestoreOutcome),
+  finishedAt: IsoDateTime,
+});
+
 export const ThreadLinkedPullRequest = Schema.Struct({
   projectId: ProjectId,
   repository: TrimmedNonEmptyString,
@@ -616,6 +635,7 @@ export const OrchestrationThread = Schema.Struct({
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
+  subagentBackend: Schema.optionalKey(SubagentBackend),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
@@ -654,6 +674,17 @@ export const OrchestrationThread = Schema.Struct({
   // Pending-only state. Optional so older servers remain compatible.
   titleRegeneration: Schema.optional(Schema.NullOr(ThreadTitleRegeneration)),
   deletedAt: Schema.NullOr(IsoDateTime),
+  editFromHere: Schema.optional(
+    Schema.NullOr(
+      Schema.Struct({
+        requestId: CommandId,
+        mode: Schema.Literals(["branch", "rewind"]),
+        sourceMessageId: MessageId,
+        targetThreadId: Schema.optional(ThreadId),
+        startedAt: IsoDateTime,
+      }),
+    ),
+  ),
   messages: Schema.Array(OrchestrationMessage),
   proposedPlans: Schema.Array(OrchestrationProposedPlan).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
@@ -1072,6 +1103,7 @@ const ThreadTurnStartBootstrapCreateThread = Schema.Struct({
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  subagentBackend: Schema.optionalKey(SubagentBackend),
   branch: Schema.NullOr(TrimmedNonEmptyString),
   worktreePath: Schema.NullOr(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
@@ -1108,8 +1140,10 @@ export const ThreadTurnStartCommand = Schema.Struct({
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
+  subagentBackend: Schema.optionalKey(SubagentBackend),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  editFromHereRequestId: Schema.optional(CommandId),
   createdAt: IsoDateTime,
 });
 
@@ -1127,8 +1161,10 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   titleSeed: Schema.optional(TrimmedNonEmptyString),
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  subagentBackend: Schema.optionalKey(SubagentBackend),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  editFromHereRequestId: Schema.optional(CommandId),
   createdAt: IsoDateTime,
 });
 
@@ -1137,6 +1173,16 @@ const ThreadTurnInterruptCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   turnId: Schema.optional(TurnId),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnSteerCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.steer"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  expectedTurnId: TurnId,
+  messageId: MessageId,
+  text: TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
   createdAt: IsoDateTime,
 });
 
@@ -1178,6 +1224,33 @@ const ThreadCheckpointRevertCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const ThreadEditFromHereCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.edit-from-here"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    sourceMessageId: MessageId,
+    replacementMessageId: MessageId,
+    editedText: TrimmedNonEmptyString,
+    mode: Schema.Literal("branch"),
+    targetThreadId: ThreadId,
+    subagentBackend: Schema.optionalKey(SubagentBackend),
+    createdAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("thread.edit-from-here"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    sourceMessageId: MessageId,
+    replacementMessageId: MessageId,
+    editedText: TrimmedNonEmptyString,
+    mode: Schema.Literal("rewind"),
+    subagentBackend: Schema.optionalKey(SubagentBackend),
+    createdAt: IsoDateTime,
+  }),
+]);
+export type ThreadEditFromHereCommand = typeof ThreadEditFromHereCommand.Type;
+
 const ThreadSessionStopCommand = Schema.Struct({
   type: Schema.Literal("thread.session.stop"),
   commandId: CommandId,
@@ -1212,10 +1285,12 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
   ThreadTurnInterruptCommand,
+  ThreadTurnSteerCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
   ThreadUserInputDismissCommand,
   ThreadCheckpointRevertCommand,
+  ThreadEditFromHereCommand,
   ThreadSessionStopCommand,
 ]);
 export type DispatchableClientOrchestrationCommand =
@@ -1242,10 +1317,12 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadInteractionModeSetCommand,
   ClientThreadTurnStartCommand,
   ThreadTurnInterruptCommand,
+  ThreadTurnSteerCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
   ThreadUserInputDismissCommand,
   ThreadCheckpointRevertCommand,
+  ThreadEditFromHereCommand,
   ThreadSessionStopCommand,
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
@@ -1326,6 +1403,21 @@ const ThreadRevertCompleteCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  sourceMessageId: Schema.optional(MessageId),
+  cutoffCreatedAt: Schema.optional(IsoDateTime),
+  editFromHereRequestId: Schema.optional(CommandId),
+  workspaceRestore: Schema.optional(ThreadWorkspaceRestoreOutcome),
+  createdAt: IsoDateTime,
+});
+
+export const ThreadEditFromHereFinishCommand = Schema.Struct({
+  type: Schema.Literal("thread.edit-from-here.finish"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  requestId: CommandId,
+  targetThreadId: Schema.optional(ThreadId),
+  error: Schema.optional(TrimmedNonEmptyString),
+  workspaceRestore: Schema.optional(ThreadWorkspaceRestoreOutcome),
   createdAt: IsoDateTime,
 });
 
@@ -1364,6 +1456,7 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
   ThreadRevertCompleteCommand,
+  ThreadEditFromHereFinishCommand,
   ThreadTitleRegenerationCompleteCommand,
   ThreadPullRequestSyncCommand,
 ]);
@@ -1395,11 +1488,14 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.interaction-mode-set",
   "thread.message-sent",
   "thread.turn-start-requested",
+  "thread.turn-steer-requested",
   "thread.turn-interrupt-requested",
   "thread.approval-response-requested",
   "thread.user-input-response-requested",
   "thread.checkpoint-revert-requested",
   "thread.reverted",
+  "thread.edit-from-here-requested",
+  "thread.edit-from-here-finished",
   "thread.session-stop-requested",
   "thread.session-set",
   "thread.proposed-plan-upserted",
@@ -1581,6 +1677,7 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
+  subagentBackend: Schema.optionalKey(SubagentBackend),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
 });
@@ -1588,6 +1685,13 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
 export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnId: Schema.optional(TurnId),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnSteerRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  expectedTurnId: TurnId,
+  messageId: MessageId,
   createdAt: IsoDateTime,
 });
 
@@ -1612,9 +1716,25 @@ export const ThreadCheckpointRevertRequestedPayload = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const ThreadEditFromHereRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  requestId: CommandId,
+  sourceMessageId: MessageId,
+  replacementMessageId: MessageId,
+  editedText: TrimmedNonEmptyString,
+  mode: Schema.Literals(["branch", "rewind"]),
+  targetThreadId: Schema.optional(ThreadId),
+  subagentBackend: Schema.optional(SubagentBackend),
+  createdAt: IsoDateTime,
+});
+
 export const ThreadRevertedPayload = Schema.Struct({
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  sourceMessageId: Schema.optional(MessageId),
+  cutoffCreatedAt: Schema.optional(IsoDateTime),
+  editFromHereRequestId: Schema.optional(CommandId),
+  workspaceRestore: Schema.optional(ThreadWorkspaceRestoreOutcome),
 });
 
 export const ThreadSessionStopRequestedPayload = Schema.Struct({
@@ -1781,6 +1901,11 @@ export const OrchestrationEvent = Schema.Union([
   }),
   Schema.Struct({
     ...EventBaseFields,
+    type: Schema.Literal("thread.turn-steer-requested"),
+    payload: ThreadTurnSteerRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
     type: Schema.Literal("thread.turn-interrupt-requested"),
     payload: ThreadTurnInterruptRequestedPayload,
   }),
@@ -1798,6 +1923,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.checkpoint-revert-requested"),
     payload: ThreadCheckpointRevertRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.edit-from-here-requested"),
+    payload: ThreadEditFromHereRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.edit-from-here-finished"),
+    payload: ThreadEditFromHereFinishedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

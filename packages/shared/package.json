@@ -79,6 +79,10 @@
       "types": "./src/toolActivity.ts",
       "import": "./src/toolActivity.ts"
     },
+    "./toolScreenshot": {
+      "types": "./src/toolScreenshot.ts",
+      "import": "./src/toolScreenshot.ts"
+    },
     "./favicon": {
       "types": "./src/favicon.ts",
       "import": "./src/favicon.ts"
@@ -258,6 +262,14 @@
     "./usageLimits": {
       "types": "./src/usageLimits.ts",
       "import": "./src/usageLimits.ts"
+    },
+    "./usageQuota": {
+      "types": "./src/usageQuota.ts",
+      "import": "./src/usageQuota.ts"
+    },
+    "./usageQuotaForecast": {
+      "types": "./src/usageQuotaForecast.ts",
+      "import": "./src/usageQuotaForecast.ts"
     },
     "./desktopAppControl": {
       "types": "./src/desktopAppControl.ts",

@@ -58,10 +58,22 @@ export function buildPeriodColumns(
   periods: readonly string[],
   byPeriod: ReadonlyMap<string, DailyTotals | HourlyTotals>,
   metric: UsageChartMetric,
+  providers?: readonly UsageProviderKind[],
 ): readonly DayColumn[] {
+  const plottedProviders =
+    providers ??
+    (() => {
+      const activeProviders = new Set<UsageProviderKind>();
+      for (const totals of byPeriod.values()) {
+        for (const provider of PROVIDER_ORDER) {
+          if (valueFor(totals, provider, metric) !== 0) activeProviders.add(provider);
+        }
+      }
+      return PROVIDER_ORDER.filter((provider) => activeProviders.has(provider));
+    })();
   return periods.map((period) => {
     const entry = byPeriod.get(period);
-    const bands = PROVIDER_ORDER.map((provider) => ({
+    const bands = plottedProviders.map((provider) => ({
       provider,
       value: valueFor(entry, provider, metric),
     }));
@@ -169,6 +181,24 @@ export function niceScale(peak: number, count: number): { max: number; ticks: re
   return { max, ticks };
 }
 
+/**
+ * Turns the merged daily totals into one column per day.
+ *
+ * Values are absolute, not cumulative: each provider is drawn from the same
+ * zero baseline so the chart never implies that one provider is always larger.
+ *
+ * The chart paths and the hover readout both consume this, so the number under
+ * the cursor is by construction the number that was plotted rather than a
+ * second derivation that can drift from it.
+ */
+export function buildDayColumns(
+  days: readonly string[],
+  byDay: ReadonlyMap<string, DailyTotals>,
+  metric: UsageChartMetric,
+): readonly DayColumn[] {
+  return buildPeriodColumns(days, byDay, metric);
+}
+
 export function UsageProviderChart({
   providers,
   days,
@@ -204,7 +234,7 @@ export function UsageProviderChart({
       };
     }
 
-    const columns = buildPeriodColumns(periods, byPeriod, metric);
+    const columns = buildPeriodColumns(periods, byPeriod, metric, providers);
     // The scale tops out at the largest single provider-period, not the sum:
     // layered series each measure from zero, so a combined peak would leave
     // the plot permanently half empty.
@@ -220,18 +250,21 @@ export function UsageProviderChart({
       max === 0 ? VIEW_HEIGHT : VIEW_HEIGHT - (value / max) * (VIEW_HEIGHT - PLOT_TOP);
 
     const built = providers.map((provider) => {
-      const providerIndex = PROVIDER_ORDER.indexOf(provider);
       const line = curvePath(
         smoothCurve(
           columns.map((column, periodIndex) => ({
             x: periodIndex * step,
-            y: toY(column.bands[providerIndex]?.value ?? 0),
+            y: toY(column.bands.find((band) => band.provider === provider)?.value ?? 0),
           })),
         ),
       );
       return {
         provider,
-        total: columns.reduce((sum, column) => sum + (column.bands[providerIndex]?.value ?? 0), 0),
+        total: columns.reduce(
+          (sum, column) =>
+            sum + (column.bands.find((band) => band.provider === provider)?.value ?? 0),
+          0,
+        ),
         area: line === "" ? "" : `${line} L${VIEW_WIDTH},${VIEW_HEIGHT} L0,${VIEW_HEIGHT} Z`,
         line,
       };

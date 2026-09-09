@@ -82,6 +82,9 @@ if (args.includes("--package")) {
                   cwd: fixture,
                   env: {
                     PATH: bin,
+                    // This fixture already supplies an isolated environment. Do not
+                    // source the real user login shell while testing package fallback.
+                    T3CODE_REMOTE_LOGIN_SHELL_LOADED: "1",
                     T3_TEST_CLI: cliPath,
                     T3_TEST_CALLS: callsPath,
                     T3_TEST_PORT: String(port),

@@ -20,3 +20,19 @@ it("keeps legacy persisted fast mode selections working", () => {
 
   assert.equal(getCodexServiceTierOptionValue(selection), "fast");
 });
+
+it("explicitly restores standard service when legacy Fast Mode is switched off", () => {
+  const selection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.6-sol", [
+    { id: "fastMode", value: false },
+  ]);
+  assert.equal(getCodexServiceTierOptionValue(selection), "default");
+});
+
+it("preserves an unspecified tier and gives the explicit service tier precedence", () => {
+  assert.equal(getCodexServiceTierOptionValue(undefined), undefined);
+  const selection = createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.6-sol", [
+    { id: "serviceTier", value: "priority" },
+    { id: "fastMode", value: false },
+  ]);
+  assert.equal(getCodexServiceTierOptionValue(selection), "priority");
+});

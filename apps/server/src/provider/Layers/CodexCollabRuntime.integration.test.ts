@@ -9,34 +9,26 @@
  */
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
-import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeOS from "node:os";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { type ProviderApprovalDecision, type ProviderEvent, ThreadId } from "@t3tools/contracts";
-import * as Deferred from "effect/Deferred";
+import { ThreadId, TurnId } from "@t3tools/contracts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
-import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import { assert, describe } from "vite-plus/test";
 
 import wireFixture from "../testFixtures/codexMultiAgentWire.json" with { type: "json" };
 import { makeCodexSessionRuntime } from "./CodexSessionRuntime.ts";
-import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 const ROOT = wireFixture.rootThreadId;
 const [CHILD_A, CHILD_B] = wireFixture.childThreadIds as [string, string];
 const MEMORY = "memory-consolidation-thread";
-const decodeMcpElicitationResponse = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(
-    Schema.Struct({
-      id: Schema.Number,
-      result: Schema.Unknown,
-    }),
-  ),
-);
+const encodeScript = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 /**
  * The captured sequence, extended with the shapes the live capture didn't
@@ -48,6 +40,28 @@ const decodeMcpElicitationResponse = Schema.decodeUnknownEffect(
 function buildScript() {
   const captured = wireFixture.notifications;
   const extras = [
+    {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: CHILD_A,
+        turnId: `${CHILD_A}-turn-1`,
+        itemId: "child-answer",
+        delta: "Child ",
+      },
+    },
+    {
+      method: "item/agentMessage/delta",
+      params: {
+        threadId: CHILD_A,
+        turnId: `${CHILD_A}-turn-1`,
+        itemId: "child-answer",
+        delta: "answer",
+      },
+    },
+    {
+      method: "future/notification",
+      params: { threadId: CHILD_A, future: { retained: [1, 2, 3] } },
+    },
     {
       method: "item/completed",
       params: {
@@ -83,322 +97,316 @@ function buildScript() {
   };
 }
 
-function capturedStartedActivity(childId = CHILD_A) {
-  const captured = wireFixture.notifications.find((entry) => {
-    const item = (entry.params as { item?: { type?: string; kind?: string } }).item;
-    return item?.type === "subAgentActivity" && item.kind === "started";
-  });
-  assert.isDefined(captured);
-  return {
-    ...captured,
-    params: {
-      ...captured.params,
-      item: {
-        ...captured.params.item,
-        agentThreadId: childId,
-        agentPath: "/root/model-check",
-      },
-    },
-  };
-}
-
-function capturedSpawnedThread(childId = CHILD_A) {
-  const captured = wireFixture.notifications.find((entry) => entry.method === "thread/started");
-  assert.isDefined(captured);
-  return {
-    ...captured,
-    params: {
-      thread: {
-        ...captured.params.thread,
-        id: childId,
-        sessionId: childId,
-        parentThreadId: ROOT,
-        agentNickname: "model-check",
-        agentRole: "verifier",
-        source: {
-          subAgent: {
-            thread_spawn: {
-              agent_nickname: "model-check",
-              agent_path: "/root/model-check",
-              agent_role: "verifier",
-              depth: 1,
-              parent_thread_id: ROOT,
-            },
-          },
-        },
-      },
-    },
-  };
-}
-
-function childSettings(threadId: string, model: string, effort: string) {
-  return {
-    method: "thread/settings/updated",
-    params: {
-      threadId,
-      threadSettings: {
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
-        collaborationMode: { mode: "default", settings: { model } },
-        cwd: "/workspace/repo",
-        effort,
-        model,
-        modelProvider: "openai",
-        sandboxPolicy: { type: "dangerFullAccess" },
-      },
-    },
-  };
-}
-
-function readRecordedRequests() {
-  return NodeFS.readFileSync(`${scriptPath}.requests`, "utf8")
-    .trim()
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });
-}
-
-const scriptPath = NodePath.join(import.meta.dirname, "../testFixtures/.collab-script.json");
-// Windows cannot run the shebang wrapper; the .cmd sibling does the same job.
-const peerPath = NodePath.join(
-  import.meta.dirname,
-  `../testFixtures/codexCollabMockPeer.${HostProcessPlatform.defaultValue() === "win32" ? "cmd" : "sh"}`,
+const scriptPath = NodePath.join(NodeOS.tmpdir(), `t3-collab-script-${process.pid}.json`);
+const peerPath = Effect.map(HostProcessPlatform, (platform) =>
+  NodePath.join(
+    import.meta.dirname,
+    `../testFixtures/codexCollabMockPeer.${platform === "win32" ? "cmd" : "sh"}`,
+  ),
 );
 
 describe("CodexSessionRuntime collab integration", () => {
-  it.effect("looks up child model metadata once after activity registration", () =>
+  it.effect("records standard, fast, inherited fast and restored standard by native turn", () =>
     Effect.gen(function* () {
-      const script = {
-        rootThreadId: ROOT,
-        recordRequests: true,
-        notifications: [
-          capturedStartedActivity(),
-          capturedStartedActivity(),
-          {
-            ...capturedStartedActivity(CHILD_B),
-            params: {
-              ...capturedStartedActivity(CHILD_B).params,
-              item: { ...capturedStartedActivity(CHILD_B).params.item, kind: "interacted" },
-            },
-          },
-          { method: "thread/closed", params: { threadId: CHILD_B } },
-          capturedSpawnedThread(ROOT),
-        ],
-        childResumeSnapshots: {
-          [CHILD_A]: { model: "gpt-5.6-luna", reasoningEffort: "low" },
-        },
-      };
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
-      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
-      NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          NodeFS.rmSync(scriptPath, { force: true });
-          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-        }),
+      const turnIds = ["standard-1", "fast-1", "fast-2", "standard-2"];
+      const observedTiers: Array<{ sessionId: string; turnId: string; serviceTier: string }> = [];
+      NodeFS.writeFileSync(
+        scriptPath,
+        encodeScript({ rootThreadId: ROOT, turnIds, notifications: [] }),
+        "utf8",
       );
-
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(scriptPath, { force: true })),
+      );
       const runtime = yield* makeCodexSessionRuntime({
-        threadId: ThreadId.make("thread-collab-model-activity"),
-        binaryPath: peerPath,
+        threadId: ThreadId.make("automatic-speed-tracking"),
+        serviceTier: "default",
+        onTurnServiceTier: (observation) =>
+          Effect.sync(() => {
+            observedTiers.push(observation);
+          }),
+        binaryPath: yield* peerPath,
         cwd: NodeOS.tmpdir(),
-        runtimeMode: "full-access",
+        runtimeMode: "approval-required",
         environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
       });
-      const metadataFiber = yield* runtime.events.pipe(
-        Stream.filter(
-          (event) =>
-            event.method === "collabAgent/metadataUpdated" &&
-            (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_A,
-        ),
-        Stream.take(1),
-        Stream.runCollect,
-        Effect.forkScoped,
-      );
-
-      const session = yield* runtime.start();
-      assert.equal(session.model, "gpt-5.6-sol");
-      yield* runtime.sendTurn({ input: "start one child" });
-      const metadataEvents = Array.from(yield* Fiber.join(metadataFiber));
-      assert.deepInclude(metadataEvents[0]?.payload, {
-        agentThreadId: CHILD_A,
-        model: "gpt-5.6-luna",
-        effort: "low",
-      });
-      assert.deepEqual(readRecordedRequests(), [
-        {
-          method: "thread/resume",
-          params: { threadId: CHILD_A, excludeTurns: true },
-        },
-      ]);
-
-      yield* runtime.close;
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-  );
-
-  it.effect("keeps child settings and reroutes newer than the resume snapshot", () =>
-    Effect.gen(function* () {
-      const statusChanged = wireFixture.notifications.find(
-        (entry) =>
-          entry.method === "thread/status/changed" &&
-          (entry.params as { threadId?: string }).threadId === CHILD_A,
-      );
-      assert.isDefined(statusChanged);
-      const script = {
-        rootThreadId: ROOT,
-        recordRequests: true,
-        notifications: [
-          childSettings(CHILD_A, "child-before", "medium"),
-          capturedSpawnedThread(),
-          childSettings(CHILD_A, "child-after", "high"),
-          {
-            method: "model/rerouted",
-            params: {
-              threadId: CHILD_A,
-              turnId: `${CHILD_A}-turn`,
-              fromModel: "child-after",
-              toModel: "child-rerouted",
-              reason: "highRiskCyberActivity",
-            },
-          },
-          {
-            method: "model/rerouted",
-            params: {
-              threadId: ROOT,
-              turnId: `${ROOT}-turn`,
-              fromModel: "gpt-5.6-sol",
-              toModel: "root-rerouted",
-              reason: "highRiskCyberActivity",
-            },
-          },
-        ],
-        childResumeSnapshots: {
-          [CHILD_A]: {
-            model: "stale-snapshot",
-            reasoningEffort: "low",
-            notifications: [statusChanged],
-          },
-        },
-      };
-      // @effect-diagnostics-next-line preferSchemaOverJson:off
-      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
-      NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          NodeFS.rmSync(scriptPath, { force: true });
-          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-        }),
-      );
-
-      const runtime = yield* makeCodexSessionRuntime({
-        threadId: ThreadId.make("thread-collab-model-spawn"),
-        binaryPath: peerPath,
-        cwd: NodeOS.tmpdir(),
-        runtimeMode: "full-access",
-        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
-      });
-      const eventsFiber = yield* runtime.events.pipe(
-        Stream.takeUntil(
-          (event) =>
-            event.method === "collabAgent/statusChanged" &&
-            (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_A,
-        ),
-        Stream.runCollect,
-        Effect.forkScoped,
-      );
-
       yield* runtime.start();
-      yield* runtime.sendTurn({ input: "start one spawned child" });
-      const events = Array.from(yield* Fiber.join(eventsFiber));
-      const started = events.find((event) => event.method === "collabAgent/started");
-      assert.deepInclude(started?.payload, {
-        agentThreadId: CHILD_A,
-        model: "child-before",
-        effort: "medium",
-      });
-      const childStatus = events.find((event) => event.method === "collabAgent/statusChanged");
-      assert.deepInclude(childStatus?.payload, {
-        agentThreadId: CHILD_A,
-        model: "child-rerouted",
-        effort: "high",
-      });
-      assert.isTrue(
-        events.some(
-          (event) =>
-            event.method === "model/rerouted" &&
-            (event.payload as { threadId?: string }).threadId === ROOT,
-        ),
-        "the root reroute must stay on the parent path",
+      for (const serviceTier of [undefined, "fast", undefined, "default"]) {
+        const completed = yield* runtime.events.pipe(
+          Stream.filter((event) => event.method === "turn/completed"),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.sendTurn({ input: "Check speed", serviceTier });
+        yield* Fiber.join(completed);
+      }
+      assert.deepEqual(
+        observedTiers,
+        ["default", "priority", "priority", "default"].map((serviceTier, index) => ({
+          sessionId: ROOT,
+          turnId: turnIds[index],
+          serviceTier,
+        })),
       );
-      assert.isFalse(
-        events.some(
-          (event) =>
-            (event.method === "thread/settings/updated" || event.method === "model/rerouted") &&
-            (event.payload as { threadId?: string }).threadId === CHILD_A,
-        ),
-        "child metadata notifications must not leak to the parent path",
-      );
-      assert.equal(readRecordedRequests().length, 1);
-
       yield* runtime.close;
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("does not delay the parent turn when the child lookup fails", () =>
-    Effect.gen(function* () {
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          NodeFS.rmSync(scriptPath, { force: true });
-          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-        }),
-      );
-      for (const [name, childSnapshot] of [
-        ["hang", { hang: true }],
-        ["error", { error: "child unavailable" }],
-      ] as const) {
-        yield* Effect.gen(function* () {
-          const marker = `lookup-${name}`;
-          const script = {
+  it.effect(
+    "correlates null-reason file approvals only with the matching provider thread, turn, and item",
+    () =>
+      Effect.gen(function* () {
+        const requests = [
+          { threadId: CHILD_A, turnId: "approval-turn", itemId: "patch-item" },
+          { threadId: ROOT, turnId: "another-turn", itemId: "patch-item" },
+          { threadId: ROOT, turnId: "approval-turn", itemId: "another-item" },
+          { threadId: ROOT, turnId: "approval-turn", itemId: "patch-item" },
+        ];
+        NodeFS.writeFileSync(
+          scriptPath,
+          encodeScript({
             rootThreadId: ROOT,
-            recordRequests: true,
-            resumeRequestMarker: marker,
-            notifications: [capturedStartedActivity()],
-            childResumeSnapshots: { [CHILD_A]: childSnapshot },
-          };
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
-          NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
-          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-
-          const runtime = yield* makeCodexSessionRuntime({
-            threadId: ThreadId.make(`thread-collab-model-${name}`),
-            binaryPath: peerPath,
-            cwd: NodeOS.tmpdir(),
-            runtimeMode: "full-access",
-            environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
-          });
-          const eventsFiber = yield* runtime.events.pipe(
-            Stream.takeUntil(
-              (event) =>
-                event.method === "serverRequest/resolved" &&
-                (event.payload as { requestId?: string }).requestId === marker,
-            ),
-            Stream.runCollect,
-            Effect.forkScoped,
+            holdTurnOpen: true,
+            notifications: [
+              {
+                method: "item/started",
+                params: {
+                  threadId: ROOT,
+                  turnId: "approval-turn",
+                  startedAtMs: 1,
+                  item: {
+                    type: "fileChange",
+                    id: "patch-item",
+                    status: "inProgress",
+                    changes: [
+                      {
+                        path: "A:\\project\\arithmetic.mjs",
+                        kind: { type: "add" },
+                        diff: "export const add = (a, b) => a + b;",
+                      },
+                      {
+                        path: "A:\\project\\old.mjs",
+                        kind: { type: "update", move_path: "A:\\project\\new.mjs" },
+                        diff: "-old\n+new",
+                      },
+                    ],
+                  },
+                },
+              },
+              ...requests.map((request, index) => ({
+                id: `approval-${index}`,
+                method: "item/fileChange/requestApproval",
+                params: { ...request, reason: null, grantRoot: null, startedAtMs: 2 },
+              })),
+            ],
+          }),
+          "utf8",
+        );
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(scriptPath, { force: true })),
+        );
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make("approval-context-test"),
+          binaryPath: yield* peerPath,
+          cwd: NodeOS.tmpdir(),
+          runtimeMode: "approval-required",
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        });
+        const events = yield* runtime.events.pipe(
+          Stream.filter((event) => event.kind === "request"),
+          Stream.tap((event) =>
+            event.requestId ? runtime.respondToRequest(event.requestId, "decline") : Effect.void,
+          ),
+          Stream.take(4),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.start();
+        yield* runtime.sendTurn({ input: "propose changes" });
+        const approvals = Array.from(yield* Fiber.join(events));
+        const matching = approvals.find((event) => {
+          const payload = event.payload as { threadId: string; turnId: string; itemId: string };
+          return (
+            payload.threadId === ROOT &&
+            payload.turnId === "approval-turn" &&
+            payload.itemId === "patch-item"
           );
-
-          yield* runtime.start();
-          yield* runtime.sendTurn({ input: "finish without child metadata" });
-          const events = Array.from(yield* Fiber.join(eventsFiber));
-          assert.isTrue(events.some((event) => event.method === "turn/completed"));
-          assert.equal(readRecordedRequests().length, 1);
-
-          yield* runtime.close;
-          NodeFS.rmSync(scriptPath, { force: true });
-          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
-        }).pipe(Effect.scoped);
-      }
-    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+        });
+        assert.include(matching?.message ?? "", "ADD A:\\project\\arithmetic.mjs");
+        assert.include(matching?.message ?? "", "export const add = (a, b) => a + b;");
+        assert.include(
+          matching?.message ?? "",
+          "UPDATE A:\\project\\old.mjs -> A:\\project\\new.mjs",
+        );
+        assert.include(matching?.message ?? "", "-old\n+new");
+        assert.deepEqual(matching?.payload, {
+          ...requests[3],
+          reason: null,
+          grantRoot: null,
+          startedAtMs: 2,
+        });
+        for (const approval of approvals.filter((event) => event !== matching)) {
+          assert.notInclude(approval.message ?? "", "arithmetic.mjs");
+          assert.include(approval.message ?? "", "unavailable");
+        }
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  it.effect(
+    "steers the existing turn without applying turn overrides or starting a replacement",
+    () =>
+      Effect.gen(function* () {
+        const turnId = "existing-provider-turn";
+        const observedTiers: Array<{ sessionId: string; turnId: string; serviceTier: string }> = [];
+        NodeFS.writeFileSync(
+          scriptPath,
+          encodeScript({
+            rootThreadId: ROOT,
+            holdTurnOpen: true,
+            expectedActiveTurnId: turnId,
+            turnIds: [turnId],
+            notifications: [],
+          }),
+          "utf8",
+        );
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(scriptPath, { force: true })),
+        );
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make("steer-thread"),
+          onTurnServiceTier: (observation) =>
+            Effect.sync(() => {
+              observedTiers.push(observation);
+            }),
+          binaryPath: yield* peerPath,
+          cwd: NodeOS.tmpdir(),
+          runtimeMode: "full-access",
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        });
+        const wire = yield* runtime.events.pipe(
+          Stream.filter(
+            (event) =>
+              event.method === "codex/rawNotification" &&
+              (event.payload as { method?: string }).method === "probe/steer",
+          ),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkScoped,
+        );
+        yield* runtime.start();
+        yield* runtime.sendTurn({ input: "start work", serviceTier: "priority" });
+        const result = yield* runtime.sendTurn({
+          expectedTurnId: TurnId.make(turnId),
+          input: "focus on tests",
+          model: "ignored-model",
+          serviceTier: "default",
+          interactionMode: "plan",
+          computerControlMode: "desktop",
+        });
+        assert.equal(result.turnId, turnId);
+        assert.deepEqual(observedTiers, [{ sessionId: ROOT, turnId, serviceTier: "priority" }]);
+        assert.deepEqual(result.resumeCursor, { threadId: ROOT });
+        const captured = Array.from(yield* Fiber.join(wire))[0]?.payload as { params?: unknown };
+        assert.deepEqual(captured.params, {
+          threadId: ROOT,
+          expectedTurnId: turnId,
+          input: [{ type: "text", text: "focus on tests" }],
+        });
+        const error = yield* runtime
+          .sendTurn({ expectedTurnId: TurnId.make("stale-turn"), input: "must fail" })
+          .pipe(Effect.flip);
+        assert.include(error.message, "active turn mismatch");
+        assert.equal((yield* runtime.getSession).activeTurnId, turnId);
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  for (const mode of ["preview", "chrome", "desktop"] as const) {
+    it.effect(`requires explicit permissions and MCP decisions in ${mode} mode`, () =>
+      Effect.gen(function* () {
+        const permissions = { network: { enabled: true } };
+        const script = {
+          rootThreadId: ROOT,
+          holdTurnOpen: true,
+          notifications: [
+            {
+              id: "permission-request",
+              method: "item/permissions/requestApproval",
+              params: {
+                cwd: NodeOS.tmpdir(),
+                itemId: "permission-item",
+                permissions,
+                startedAtMs: 1,
+                threadId: ROOT,
+                turnId: "turn-approval",
+              },
+            },
+            {
+              id: "mcp-request",
+              method: "mcpServer/elicitation/request",
+              params: {
+                _meta: { codex_approval_kind: "mcp_tool_call" },
+                mode: "form",
+                message: "Allow this tool?",
+                requestedSchema: { type: "object", properties: {} },
+                serverName: "sample-tool",
+                threadId: ROOT,
+                turnId: "turn-approval",
+              },
+            },
+          ],
+        };
+        NodeFS.writeFileSync(scriptPath, encodeScript(script), "utf8");
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => NodeFS.rmSync(scriptPath, { force: true })),
+        );
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make(`thread-approval-${mode}`),
+          binaryPath: yield* peerPath,
+          cwd: NodeOS.tmpdir(),
+          runtimeMode: "full-access",
+          computerControlMode: mode,
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        });
+        const approvals: Array<string> = [];
+        const replies: Array<unknown> = [];
+        const events = yield* runtime.events.pipe(
+          Stream.tap((event) =>
+            Effect.gen(function* () {
+              if (event.kind === "request" && event.requestId) {
+                approvals.push(event.method);
+                yield* runtime.respondToRequest(
+                  event.requestId,
+                  event.method === "item/permissions/requestApproval" ? "decline" : "accept",
+                );
+              }
+              const raw = event.payload as { method?: string; params?: unknown } | undefined;
+              if (event.method === "codex/rawNotification" && raw?.method === "probe/response")
+                replies.push(raw.params);
+            }),
+          ),
+          Stream.takeUntil(() => replies.length === 2),
+          Stream.runDrain,
+          Effect.forkScoped,
+        );
+        yield* runtime.start();
+        yield* runtime.sendTurn({ input: "request approvals" });
+        yield* Fiber.join(events);
+        assert.sameMembers(approvals, [
+          "item/permissions/requestApproval",
+          "mcpServer/elicitation/request",
+        ]);
+        assert.deepInclude(replies, {
+          id: "permission-request",
+          result: { permissions: {}, scope: "turn" },
+        });
+        assert.deepInclude(replies, { id: "mcp-request", result: { action: "accept" } });
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
 
   it.effect("replays the captured fan-out into synthetic agent events without child leaks", () =>
     Effect.gen(function* () {
@@ -410,7 +418,7 @@ describe("CodexSessionRuntime collab integration", () => {
 
       const runtime = yield* makeCodexSessionRuntime({
         threadId: ThreadId.make("thread-collab-integration"),
-        binaryPath: peerPath,
+        binaryPath: yield* peerPath,
         cwd: NodeOS.tmpdir(),
         runtimeMode: "full-access",
         environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
@@ -434,6 +442,31 @@ describe("CodexSessionRuntime collab integration", () => {
       assert.include(methods, "collabAgent/activity");
       assert.include(methods, "collabAgent/turnCompleted");
       assert.include(methods, "collabAgent/closed");
+      const original = events.find(
+        (event) =>
+          event.method === "codex/rawNotification" &&
+          (event.payload as { method?: string }).method === "future/notification",
+      );
+      assert.deepEqual(original?.payload, {
+        jsonrpc: "2.0",
+        method: "future/notification",
+        params: { threadId: CHILD_A, future: { retained: [1, 2, 3] } },
+      });
+      const childDelta = events.find(
+        (event) =>
+          event.method === "collabAgent/notification" &&
+          (event.payload as { wire?: { method: string } }).wire?.method ===
+            "item/agentMessage/delta",
+      );
+      assert.isDefined(childDelta, "child deltas remain available as agent events");
+      assert.isTrue(
+        events.some(
+          (event) =>
+            event.method === "collabAgent/notification" &&
+            (event.payload as { summary?: string }).summary === "Child answer",
+        ),
+        "child display text accumulates deltas",
+      );
 
       const childTurnCompleted = events.find(
         (event) =>
@@ -552,7 +585,7 @@ describe("CodexSessionRuntime collab integration", () => {
 
       const runtime = yield* makeCodexSessionRuntime({
         threadId: ThreadId.make("thread-collab-stop"),
-        binaryPath: peerPath,
+        binaryPath: yield* peerPath,
         cwd: NodeOS.tmpdir(),
         runtimeMode: "full-access",
         environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
@@ -630,7 +663,7 @@ describe("CodexSessionRuntime collab integration", () => {
 
       const runtime = yield* makeCodexSessionRuntime({
         threadId: ThreadId.make("thread-codex-queued-stop"),
-        binaryPath: peerPath,
+        binaryPath: yield* peerPath,
         cwd: NodeOS.tmpdir(),
         runtimeMode: "full-access",
         environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
@@ -653,116 +686,4 @@ describe("CodexSessionRuntime collab integration", () => {
       yield* runtime.close;
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
-
-  const elicitationCases = [
-    {
-      decision: "accept",
-      response: { action: "accept", content: { approval: "once" } },
-    },
-    {
-      decision: "acceptForSession",
-      response: {
-        action: "accept",
-        _meta: { persist: "session" },
-        content: { approval: "session" },
-      },
-    },
-    {
-      decision: "acceptAlways",
-      response: {
-        action: "accept",
-        _meta: { persist: "always" },
-        content: { approval: "always" },
-      },
-    },
-    { decision: "decline", response: { action: "decline" } },
-    { decision: "cancel", response: { action: "cancel" } },
-  ] satisfies ReadonlyArray<{
-    readonly decision: ProviderApprovalDecision;
-    readonly response: Record<string, unknown>;
-  }>;
-
-  for (const { decision, response } of elicitationCases) {
-    it.live(`returns the MCP elicitation ${decision} response to Codex`, () =>
-      Effect.gen(function* () {
-        const scriptedRequest = {
-          id: 7001,
-          method: "mcpServer/elicitation/request",
-          params: {
-            mode: "form",
-            message: "Allow ChatGPT to use Safari?",
-            serverName: "computer-use",
-            threadId: ROOT,
-            turnId: wireFixture.responses.turnStart.turn.id,
-            _meta: { app_name: "Safari", persist: ["session", "always"] },
-            requestedSchema: {
-              type: "object",
-              properties: {
-                approval: {
-                  type: "string",
-                  enum: ["once", "session", "always"],
-                },
-              },
-              required: ["approval"],
-            },
-          },
-        };
-        const script = {
-          rootThreadId: ROOT,
-          holdTurnOpen: true,
-          completeTurnOnServerResponse: true,
-          notifications: [],
-          serverRequests: [scriptedRequest],
-        };
-        const responsesPath = `${scriptPath}.responses`;
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
-        NodeFS.rmSync(responsesPath, { force: true });
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            NodeFS.rmSync(scriptPath, { force: true });
-            NodeFS.rmSync(responsesPath, { force: true });
-          }),
-        );
-
-        const runtime = yield* makeCodexSessionRuntime({
-          threadId: ThreadId.make("thread-codex-mcp-elicitation"),
-          binaryPath: peerPath,
-          cwd: NodeOS.tmpdir(),
-          runtimeMode: "auto",
-          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
-        });
-        const approvalRequested = yield* Deferred.make<ProviderEvent>();
-        const turnCompleted = yield* Deferred.make<void>();
-        yield* runtime.events.pipe(
-          Stream.runForEach((event) =>
-            event.method === "mcpServer/elicitation/request"
-              ? Deferred.succeed(approvalRequested, event).pipe(Effect.asVoid)
-              : event.method === "turn/completed"
-                ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
-                : Effect.void,
-          ),
-          Effect.forkScoped,
-        );
-
-        yield* runtime.start();
-        yield* runtime.sendTurn({ input: "Open Safari" });
-        const approval = yield* Deferred.await(approvalRequested);
-        assert.equal(approval.requestKind, "mcp-elicitation");
-        assert.isDefined(approval.requestId);
-        if (approval.requestId === undefined) return;
-
-        yield* runtime.respondToRequest(approval.requestId, decision);
-        yield* Deferred.await(turnCompleted);
-
-        const recordedResponse = yield* decodeMcpElicitationResponse(
-          NodeFS.readFileSync(responsesPath, "utf8"),
-        );
-        assert.equal(recordedResponse.id, scriptedRequest.id);
-        assert.deepEqual(recordedResponse.result, response);
-
-        yield* runtime.close;
-      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
-    );
-  }
 });

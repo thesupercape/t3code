@@ -380,7 +380,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         case "ConnectRequested":
           break;
         case "Wakeup":
-          if (next.reason === "application-active-reconnect") {
+          if (
+            next.reason === "application-active-reconnect" ||
+            next.reason === "application-bootstrap-retry"
+          ) {
             return true;
           }
           if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
@@ -462,7 +465,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                   }
                   break;
                 case "Wakeup":
-                  if (probeEvent.signal.reason === "application-active-reconnect") {
+                  if (
+                    probeEvent.signal.reason === "application-active-reconnect" ||
+                    probeEvent.signal.reason === "application-bootstrap-retry"
+                  ) {
                     yield* Fiber.interrupt(probe);
                     return true;
                   }
@@ -613,7 +619,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           const next = yield* Queue.take(signals);
           switch (next._tag) {
             case "Wakeup":
-              return ConnectionWakeups.isApplicationActiveWakeup(next.reason);
+              return ConnectionWakeups.isApplicationRecoveryWakeup(next.reason);
             case "ConnectRequested":
             case "DisconnectRequested":
             case "RetryRequested":
@@ -627,7 +633,8 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
   const waitForSignal = Queue.take(signals).pipe(
     Effect.map(
-      (next) => next._tag === "Wakeup" && ConnectionWakeups.isApplicationActiveWakeup(next.reason),
+      (next) =>
+        next._tag === "Wakeup" && ConnectionWakeups.isApplicationRecoveryWakeup(next.reason),
     ),
   );
 
@@ -759,6 +766,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     Effect.forkScoped,
   );
   yield* wakeups.changes.pipe(
+    Stream.changes,
     Stream.runForEach((reason) => signal({ _tag: "Wakeup", reason })),
     Effect.forkScoped,
   );

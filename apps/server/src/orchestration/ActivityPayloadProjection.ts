@@ -1,9 +1,11 @@
-import type {
-  OrchestrationEvent,
-  OrchestrationThreadActivity,
-  OrchestrationThreadDetailSnapshot,
+import {
+  T3_WORKER_TOOL_NAMES,
+  type OrchestrationEvent,
+  type OrchestrationThreadActivity,
+  type OrchestrationThreadDetailSnapshot,
+  type T3WorkerToolName,
 } from "@t3tools/contracts";
-import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
+import { isChromeScreenshotTool, readToolScreenshot } from "@t3tools/shared/toolScreenshot";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -144,45 +146,23 @@ function projectCommandValue(data: Record<string, unknown>): unknown {
   return undefined;
 }
 
-function projectViewedImagePath(data: Record<string, unknown>): string | undefined {
-  const directPath = asTrimmedString(data.imagePath);
-  if (directPath && isWorkspaceImagePreviewPath(directPath)) {
-    return directPath;
-  }
-
-  const toolName = asTrimmedString(data.toolName)?.toLowerCase();
-  if (toolName !== "read" && toolName !== "read file") {
-    return undefined;
-  }
-  const input = asRecord(data.input);
-  const inputPath = asTrimmedString(input?.file_path) ?? asTrimmedString(input?.path);
-  return inputPath && isWorkspaceImagePreviewPath(inputPath) ? inputPath : undefined;
-}
-
 function summarizeToolTextOutput(value: string): string | null {
-  let meaningfulLineCount = 0;
-  let offset = 0;
-
-  while (offset <= value.length) {
-    const newlineIndex = value.indexOf("\n", offset);
-    const lineEnd = newlineIndex === -1 ? value.length : newlineIndex;
-    const line = value.slice(offset, lineEnd).replace(/\s+/g, " ").trim();
+  const lines: string[] = [];
+  for (const rawLine of value.split(/\r?\n/u)) {
+    const line = rawLine.replace(/\s+/g, " ").trim();
     if (line.length > 0) {
-      meaningfulLineCount += 1;
-      if (line !== "```") {
-        const summary = line.length <= 84 ? line : `${line.slice(0, 83).trimEnd()}…`;
-        // V8 can retain the full tool output behind a short sliced string.
-        // Join a tiny character array so the returned preview owns its bytes.
-        return Array.from(summary).join("");
-      }
+      lines.push(line);
     }
-    if (newlineIndex === -1) {
-      break;
-    }
-    offset = newlineIndex + 1;
   }
 
-  return meaningfulLineCount > 1 ? `${meaningfulLineCount.toLocaleString()} lines` : null;
+  const firstLine = lines.find((line) => line !== "```");
+  if (firstLine) {
+    return firstLine.length <= 84 ? firstLine : `${firstLine.slice(0, 83).trimEnd()}…`;
+  }
+  if (lines.length > 1) {
+    return `${lines.length.toLocaleString()} lines`;
+  }
+  return null;
 }
 
 /**
@@ -240,13 +220,239 @@ function summarizeMcpResult(result: unknown): Record<string, unknown> | undefine
   return summary ? { content: summary } : undefined;
 }
 
+function t3WorkerToolName(value: unknown): T3WorkerToolName | null {
+  const name = asTrimmedString(value);
+  if (name === null) return null;
+  return (
+    T3_WORKER_TOOL_NAMES.find(
+      (workerTool) => name === workerTool || name.endsWith(`_${workerTool}`),
+    ) ?? null
+  );
+}
+
+function projectPrimitiveFields(
+  value: unknown,
+  fields: ReadonlyArray<string>,
+): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const projected: Record<string, unknown> = {};
+  for (const field of fields) {
+    const entry = source[field];
+    if (
+      typeof entry === "string" ||
+      typeof entry === "number" ||
+      typeof entry === "boolean" ||
+      entry === null
+    ) {
+      projected[field] = entry;
+    }
+  }
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectWorkerUsage(value: unknown): Record<string, unknown> | undefined {
+  return projectPrimitiveFields(value, [
+    "inputTokens",
+    "cachedInputTokens",
+    "outputTokens",
+    "reasoningTokens",
+    "reasoningOutputTokens",
+    "totalTokens",
+    "toolUses",
+    "durationMillis",
+    "model",
+    "reasoningEffort",
+    "provider",
+  ]);
+}
+
+function projectWorkerObserverReport(value: unknown): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const projected =
+    projectPrimitiveFields(source, [
+      "id",
+      "workerId",
+      "activationId",
+      "model",
+      "appearsBlocked",
+      "safeToLeaveRunning",
+      "parentDecision",
+      "observedStatus",
+      "readOnly",
+      "generatedAt",
+    ]) ?? {};
+  const summary = asTrimmedString(source.report);
+  if (summary) projected.summary = summarizeToolTextOutput(summary);
+  const progress = asTrimmedString(source.progress);
+  if (progress) projected.progress = summarizeToolTextOutput(progress);
+  const nextAction = asTrimmedString(source.nextAction);
+  if (nextAction) projected.nextAction = summarizeToolTextOutput(nextAction);
+  for (const field of ["blockers", "files", "verification"] as const) {
+    const entries = Array.isArray(source[field])
+      ? source[field]
+          .map(asTrimmedString)
+          .filter((entry): entry is string => entry !== null)
+          .slice(0, 12)
+      : [];
+    if (entries.length > 0) projected[field] = entries;
+  }
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectWorkerSummary(value: unknown): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const projected =
+    projectPrimitiveFields(source, [
+      "id",
+      "displayName",
+      "title",
+      "status",
+      "backend",
+      "parentThreadId",
+      "projectId",
+      "environmentId",
+      "providerInstanceId",
+      "providerThreadId",
+      "model",
+      "runtimeMode",
+      "workingDirectory",
+      "permissionMode",
+      "reasoningEffort",
+      "createdAt",
+      "updatedAt",
+      "closedAt",
+      "activeActivationId",
+      "lastActivityAt",
+      "lastDirectMessageAt",
+      "unreadMessageCount",
+      "activationCount",
+      "resumable",
+      "elapsedMs",
+      "hasPendingApproval",
+      "hasUnreadEvents",
+    ]) ?? {};
+  const usage = projectWorkerUsage(source.usage);
+  if (usage) projected.usage = usage;
+  const lastModelCallUsage = projectWorkerUsage(source.lastModelCallUsage);
+  if (lastModelCallUsage) projected.lastModelCallUsage = lastModelCallUsage;
+  const usageCoverage = projectPrimitiveFields(source.usageCoverage, ["status", "reason"]);
+  if (usageCoverage) projected.usageCoverage = usageCoverage;
+  const observer = projectWorkerObserverReport(source.latestObserverReport);
+  if (observer) projected.latestObserverReport = observer;
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectWorkerApproval(value: unknown): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const projected =
+    projectPrimitiveFields(source, [
+      "requestId",
+      "workerId",
+      "activationId",
+      "kind",
+      "requestedAt",
+      "status",
+      "resolvedAt",
+      "decision",
+    ]) ?? {};
+  for (const field of ["summary", "detail"] as const) {
+    const value = asTrimmedString(source[field]);
+    if (value) projected[field] = summarizeToolTextOutput(value);
+  }
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectWorkerDetail(value: unknown): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const projected: Record<string, unknown> = {};
+  const summary = projectWorkerSummary(source.summary);
+  if (summary) projected.summary = summary;
+  const assignment = asTrimmedString(source.assignment);
+  if (assignment) projected.assignment = summarizeToolTextOutput(assignment);
+  const pendingApproval = projectWorkerApproval(source.pendingApproval);
+  if (pendingApproval) projected.pendingApproval = pendingApproval;
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectWorkerWaitResult(value: unknown): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  const projected =
+    projectPrimitiveFields(source, ["leaseId", "status", "reason", "completedAt"]) ?? {};
+  const workers = Array.isArray(source.workers)
+    ? source.workers
+        .map(projectWorkerSummary)
+        .filter((worker): worker is Record<string, unknown> => worker !== undefined)
+    : [];
+  if (workers.length > 0) projected.workers = workers;
+  const events = Array.isArray(source.events)
+    ? source.events
+        .map((event) =>
+          projectPrimitiveFields(event, [
+            "workerId",
+            "activationId",
+            "reason",
+            "status",
+            "occurredAt",
+            "messageId",
+          ]),
+        )
+        .filter((event): event is Record<string, unknown> => event !== undefined)
+    : [];
+  if (events.length > 0) projected.events = events;
+  const lease = projectPrimitiveFields(source.lease, [
+    "leaseId",
+    "parentThreadId",
+    "deadlineAt",
+    "status",
+    "wakeReason",
+    "createdAt",
+    "completedAt",
+  ]);
+  const leaseSource = asRecord(source.lease);
+  if (lease && Array.isArray(leaseSource?.workerIds)) {
+    lease.workerIds = leaseSource.workerIds.filter((id) => typeof id === "string").slice(0, 64);
+  }
+  if (lease) projected.lease = lease;
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
+
+function projectT3WorkerResult(
+  toolName: T3WorkerToolName,
+  value: unknown,
+): Record<string, unknown> | undefined {
+  const source = asRecord(value);
+  if (!source) return undefined;
+  if (toolName === "worker_wait") return projectWorkerWaitResult(source);
+  if (toolName === "worker_observe") return projectWorkerObserverReport(source);
+  if (toolName === "worker_list") {
+    const projected = projectPrimitiveFields(source, ["nextCursor"]) ?? {};
+    const workers = Array.isArray(source.workers)
+      ? source.workers
+          .map(projectWorkerSummary)
+          .filter((worker): worker is Record<string, unknown> => worker !== undefined)
+      : [];
+    if (workers.length > 0) projected.workers = workers;
+    return Object.keys(projected).length > 0 ? projected : undefined;
+  }
+  return projectWorkerDetail(source);
+}
+
 /**
  * MCP tool calls carry full tool results (`data.item.result` on Codex,
  * `data.result` on Claude/OpenCode) that used to bypass slimming entirely to
  * keep the expanded-row UI working. Keep the fields the UI actually renders
  * and summarize the result like regular tool output.
  */
-function projectMcpToolCallData(data: Record<string, unknown>): Record<string, unknown> {
+function projectMcpToolCallData(
+  data: Record<string, unknown>,
+  threadId?: string,
+): Record<string, unknown> {
   const projectedData: Record<string, unknown> = {};
 
   const item = asRecord(data.item);
@@ -257,7 +463,15 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
         projectedItem[key] = item[key];
       }
     }
-    const result = summarizeMcpResult(item.result);
+    const workerToolName = t3WorkerToolName(item.tool);
+    const screenshot = isChromeScreenshotTool(item.tool)
+      ? readToolScreenshot(item.result, threadId)
+      : null;
+    const result = screenshot
+      ? { screenshot, content: `Screenshot ${screenshot.width} × ${screenshot.height}` }
+      : workerToolName
+        ? (projectT3WorkerResult(workerToolName, item.result) ?? summarizeMcpResult(item.result))
+        : summarizeMcpResult(item.result);
     if (result) {
       projectedItem.result = result;
     }
@@ -271,7 +485,15 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
     projectedData.input = data.input;
   }
   if (!item) {
-    const result = summarizeMcpResult(data.result);
+    const workerToolName = t3WorkerToolName(data.toolName);
+    const screenshot = isChromeScreenshotTool(data.toolName)
+      ? readToolScreenshot(data.result, threadId)
+      : null;
+    const result = screenshot
+      ? { screenshot, content: `Screenshot ${screenshot.width} × ${screenshot.height}` }
+      : workerToolName
+        ? (projectT3WorkerResult(workerToolName, data.result) ?? summarizeMcpResult(data.result))
+        : summarizeMcpResult(data.result);
     if (result) {
       projectedData.result = result;
     }
@@ -291,6 +513,14 @@ function projectMcpToolCallData(data: Record<string, unknown>): Record<string, u
   }
 
   return projectedData;
+}
+
+/** Screenshots persist only their attachment pointer, including terminal tool activities. */
+export function projectChromeScreenshotData(data: unknown, threadId: string): unknown {
+  const source = asRecord(data);
+  if (!source || !isChromeScreenshotTool(asRecord(source.item)?.tool ?? source.toolName))
+    return data;
+  return projectMcpToolCallData(source, threadId);
 }
 
 function projectRawOutput(value: unknown): Record<string, unknown> | undefined {
@@ -390,10 +620,6 @@ export function projectActivityPayload(
   if (command !== undefined) {
     projectedData.command = command;
   }
-  const imagePath = projectViewedImagePath(data);
-  if (imagePath) {
-    projectedData.imagePath = imagePath;
-  }
 
   const changedFiles: string[] = [];
   collectChangedFiles(data, changedFiles, new Set<string>(), 0);
@@ -408,14 +634,8 @@ export function projectActivityPayload(
   if ("kind" in data) {
     projectedData.kind = data.kind;
   }
-  if ("toolName" in data) {
-    projectedData.toolName = data.toolName;
-  }
 
-  const rawOutput =
-    projectRawOutput(data.rawOutput) ??
-    projectAcpContent(data.content) ??
-    (payload.itemType === "command_execution" ? summarizeMcpResult(data.result) : undefined);
+  const rawOutput = projectRawOutput(data.rawOutput) ?? projectAcpContent(data.content);
   if (rawOutput) {
     projectedData.rawOutput = rawOutput;
   }
@@ -521,6 +741,9 @@ function toolLifecycleIdentity(activity: OrchestrationThreadActivity): string | 
  * update within the turn — a later update belongs to a subsequent call that
  * reuses the same identity and is still in flight. Rows without a lifecycle
  * identity pass through, matching the clients, which never collapse them.
+ * Live `thread.activity-appended` events are untouched: updates still stream
+ * in real time and the completion supersedes them on the client as before.
+ *
  * Deliberate divergence from client collapse: clients fold only *adjacent*
  * lifecycle rows, so a superseded update separated from its completion by an
  * interleaved parallel call renders as its own row today, and this drop
@@ -547,7 +770,7 @@ function dropSupersededToolUpdatedActivities(
     if (!identity) {
       continue;
     }
-    const key = `${activity.turnId ?? ""}\u0000${identity}`;
+    const key = `${activity.turnId ?? ""} ${identity}`;
     const indices = completionIndicesByKey.get(key);
     if (indices) {
       indices.push(index);
@@ -567,7 +790,7 @@ function dropSupersededToolUpdatedActivities(
     if (!identity) {
       return true;
     }
-    const indices = completionIndicesByKey.get(`${activity.turnId ?? ""}\u0000${identity}`);
+    const indices = completionIndicesByKey.get(`${activity.turnId ?? ""} ${identity}`);
     return !indices?.some((completionIndex) => completionIndex > index);
   });
 }

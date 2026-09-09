@@ -26,6 +26,8 @@ import {
   ThreadTurnInterruptRequestedPayload as ContractsThreadTurnInterruptRequestedPayloadSchema,
   ThreadApprovalResponseRequestedPayload as ContractsThreadApprovalResponseRequestedPayloadSchema,
   ThreadCheckpointRevertRequestedPayload as ContractsThreadCheckpointRevertRequestedPayloadSchema,
+  ThreadEditFromHereRequestedPayload as ContractsThreadEditFromHereRequestedPayloadSchema,
+  ThreadEditFromHereFinishedPayload as ContractsThreadEditFromHereFinishedPayloadSchema,
   ThreadSessionStopRequestedPayload as ContractsThreadSessionStopRequestedPayloadSchema,
 } from "@t3tools/contracts";
 
@@ -63,4 +65,6 @@ export const ThreadApprovalResponseRequestedPayload =
   ContractsThreadApprovalResponseRequestedPayloadSchema;
 export const ThreadCheckpointRevertRequestedPayload =
   ContractsThreadCheckpointRevertRequestedPayloadSchema;
+export const ThreadEditFromHereRequestedPayload = ContractsThreadEditFromHereRequestedPayloadSchema;
+export const ThreadEditFromHereFinishedPayload = ContractsThreadEditFromHereFinishedPayloadSchema;
 export const ThreadSessionStopRequestedPayload = ContractsThreadSessionStopRequestedPayloadSchema;

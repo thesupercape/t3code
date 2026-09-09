@@ -88,6 +88,25 @@ import { GitWorkflowService } from "../src/git/GitWorkflowService.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as PullRequestService from "../src/pullRequest/PullRequestService.ts";
+import * as WorkerService from "../src/worker/WorkerService.ts";
+
+const testWorkerService = WorkerService.WorkerService.of({
+  start: () => Effect.die("Worker service is not used in this test"),
+  list: () => Effect.die("Worker service is not used in this test"),
+  get: () => Effect.die("Worker service is not used in this test"),
+  send: () => Effect.die("Worker service is not used in this test"),
+  wait: () => Effect.die("Worker service is not used in this test"),
+  observe: () => Effect.die("Worker service is not used in this test"),
+  interrupt: () => Effect.die("Worker service is not used in this test"),
+  close: () => Effect.die("Worker service is not used in this test"),
+  respondToApproval: () => Effect.die("Worker service is not used in this test"),
+  // Rewind reconciles worker parent timelines in the normal path. This
+  // fixture has no workers, so that reconciliation is a valid no-op.
+  reconcileParentAfterRewind: () => Effect.succeed([]),
+  handleProviderEvent: () => Effect.void,
+  recover: Effect.void,
+  stream: Stream.empty,
+});
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -311,6 +330,7 @@ export const makeOrchestrationIntegrationHarness = (
     const runtimeServicesLayer = Layer.mergeAll(
       projectionSnapshotQueryLayer,
       orchestrationLayer.pipe(Layer.provide(projectionSnapshotQueryLayer)),
+      Layer.succeed(WorkerService.WorkerService, testWorkerService),
       ProjectionCheckpointRepositoryLive,
       ProjectionPendingApprovalRepositoryLive,
       checkpointStoreLayer,

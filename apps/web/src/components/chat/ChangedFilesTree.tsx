@@ -25,6 +25,9 @@ const EMPTY_DIRECTORY_OVERRIDES: Record<string, boolean> = {};
 export const ChangedFilesCard = memo(function ChangedFilesCard(props: {
   turnId: TurnId;
   files: ReadonlyArray<TurnDiffFileChange>;
+  expanded?: boolean;
+  showCompactPreview?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
   allDirectoriesExpanded: boolean;
   resolvedTheme: "light" | "dark";
   onToggleAllDirectories: () => void;
@@ -33,6 +36,8 @@ export const ChangedFilesCard = memo(function ChangedFilesCard(props: {
   const {
     turnId,
     files,
+    expanded = true,
+    onExpandedChange,
     allDirectoriesExpanded,
     resolvedTheme,
     onToggleAllDirectories,
@@ -49,6 +54,7 @@ export const ChangedFilesCard = memo(function ChangedFilesCard(props: {
       <div
         data-changed-files-header=""
         className="sticky top-2 z-10 flex items-center justify-between gap-2 rounded-t-lg bg-secondary px-3 py-2 dark:bg-[color-mix(in_srgb,var(--input)_20%,var(--background))]"
+        onClick={() => onExpandedChange?.(!expanded)}
       >
         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs font-medium text-foreground">
           <span>
@@ -110,14 +116,16 @@ export const ChangedFilesCard = memo(function ChangedFilesCard(props: {
           </Tooltip>
         </div>
       </div>
-      <ChangedFilesTree
-        key={`${turnId}:${allDirectoriesExpanded}`}
-        turnId={turnId}
-        files={files}
-        allDirectoriesExpanded={allDirectoriesExpanded}
-        resolvedTheme={resolvedTheme}
-        onOpenTurnDiff={onOpenTurnDiff}
-      />
+      {expanded ? (
+        <ChangedFilesTree
+          key={`${turnId}:${allDirectoriesExpanded}`}
+          turnId={turnId}
+          files={files}
+          allDirectoriesExpanded={allDirectoriesExpanded}
+          resolvedTheme={resolvedTheme}
+          onOpenTurnDiff={onOpenTurnDiff}
+        />
+      ) : null}
     </div>
   );
 });

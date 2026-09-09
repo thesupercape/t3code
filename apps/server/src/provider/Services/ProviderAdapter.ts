@@ -27,32 +27,26 @@ import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 
-/**
- * How ProviderService runs manual context compaction for an adapter.
- * Native adapters expose a start call and must emit a compacted thread state
- * when they finish. Slash-command adapters get the command sent as a turn.
- */
+export interface ProviderAdapterCapabilities {
+  /**
+   * Declares whether changing the model on an existing session is supported.
+   */
+  readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /** Whether provider-native conversation rewind is supported. */
+  readonly supportsConversationRollback?: boolean;
+  /** Whether a continuation can be sent without a user prompt. */
+  readonly promptlessTurnContinuation?: boolean;
+}
+
 export type ProviderCompaction<TError> =
+  | { readonly type: "slash-command"; readonly command: string }
   | {
       readonly type: "native";
       readonly start: (
         threadId: ThreadId,
         modelSelection?: ProviderSendTurnInput["modelSelection"],
       ) => Effect.Effect<void, TError>;
-    }
-  | { readonly type: "slash-command"; readonly command: `/${string}` };
-
-export interface ProviderAdapterCapabilities {
-  /**
-   * Declares whether changing the model on an existing session is supported.
-   */
-  readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
-  /** Starts a resumed turn with no synthetic user prompt. Omitted means the
-      adapter needs an explicit continuation instruction. */
-  readonly promptlessTurnContinuation?: boolean;
-  /** False when native conversation history cannot be rewound. */
-  readonly supportsConversationRollback?: boolean;
-}
+    };
 
 export interface ProviderThreadTurnSnapshot {
   readonly id: TurnId;
@@ -70,6 +64,7 @@ export interface ProviderAdapterShape<TError> {
    */
   readonly provider: ProviderDriverKind;
   readonly capabilities: ProviderAdapterCapabilities;
+  readonly compaction?: ProviderCompaction<TError>;
 
   /**
    * Start a provider-backed session.
@@ -79,14 +74,20 @@ export interface ProviderAdapterShape<TError> {
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**
+   * Build a provider-native cursor that forks source history through the
+   * inclusive turn boundary. Omitted means the provider cannot fork.
+   */
+  readonly createForkResumeCursor?: (
+    sourceThreadId: ThreadId,
+    lastTurnId: TurnId,
+  ) => Effect.Effect<unknown, TError>;
+
+  /**
    * Send a turn to an active provider session.
    */
   readonly sendTurn: (
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, TError>;
-
-  /** Omitted when this adapter does not support manual context compaction. */
-  readonly compaction?: ProviderCompaction<TError>;
 
   /**
    * Interrupt an active turn.

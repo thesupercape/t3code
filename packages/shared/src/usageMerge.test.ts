@@ -1,5 +1,6 @@
 import {
   USAGE_CONTRACT_VERSION,
+  USAGE_MERGE_COMPATIBLE_SINCE,
   type EnvironmentId,
   type UsageBucket,
   type UsageDay,
@@ -74,6 +75,39 @@ function environment(id: string, usageSummary: UsageSummary): EnvironmentUsage {
 }
 
 describe("mergeUsage", () => {
+  it("keeps Fast Mode provenance without double counting mirrored sources", () => {
+    const source = { provider: "codex" as const, hostId: "desktop", homePath: "/codex" };
+    const data = summary(
+      [
+        bucket({
+          provider: "codex",
+          serviceTier: "priority",
+          serviceTierSource: "userReported",
+          costUsd: 20,
+          records: 2,
+        }),
+        bucket({
+          provider: "codex",
+          serviceTier: "unknown",
+          serviceTierSource: "unknown",
+          costUsd: 10,
+          records: 3,
+        }),
+      ],
+      [source],
+    );
+    const merged = mergeUsage(
+      [environment("a", data), environment("b", data)],
+      USAGE_CONTRACT_VERSION,
+    );
+    expect(merged.costUsd).toBe(30);
+    expect(merged.codexServiceTiers).toEqual({
+      fastCostUsd: 20,
+      fastRecords: 2,
+      userReportedRecords: 2,
+      unknownRecords: 3,
+    });
+  });
   it("sums environments that read different transcript directories", () => {
     const merged = mergeUsage(
       [
@@ -146,7 +180,7 @@ describe("mergeUsage", () => {
     ).toEqual({ claude: 1, codex: 1 });
   });
 
-  it("excludes an environment reporting an older contract version", () => {
+  it("excludes an environment below the compatible contract floor", () => {
     const merged = mergeUsage(
       [
         environment(
@@ -158,7 +192,7 @@ describe("mergeUsage", () => {
           summary(
             [bucket()],
             [{ provider: "claude", hostId: "linux", homePath: "/b" }],
-            USAGE_CONTRACT_VERSION - 2,
+            USAGE_MERGE_COMPATIBLE_SINCE - 1,
           ),
         ),
       ],
@@ -337,5 +371,102 @@ describe("mergeUsage", () => {
     ]);
     expect(merged.daily).toHaveLength(1);
     expect(merged.daily[0]?.costUsd).toBe(10);
+  });
+
+  it("aggregates hourly usage by provider and model after source dedupe", () => {
+    const sharedClaude = {
+      provider: "claude" as const,
+      hostId: "mac",
+      homePath: "/home/theo/.claude",
+    };
+    const hourOne = "2026-08-07T09:37:00.000Z";
+    const hourTwo = "2026-08-07T10:37:00.000Z";
+    const merged = mergeUsage(
+      [
+        environment(
+          "env-a",
+          summary(
+            [
+              bucket({ model: "shared-model", hourStart: hourOne, costUsd: 3, records: 2 }),
+              bucket({
+                provider: "codex",
+                model: "shared-model",
+                hourStart: hourOne,
+                costUsd: 4,
+                records: 1,
+              }),
+              bucket({
+                model: "free-model",
+                hourStart: hourOne,
+                costUsd: 0,
+                records: 1,
+                totals: {
+                  uncachedInputTokens: 0,
+                  cachedInputTokens: 0,
+                  cacheCreationTokens: 0,
+                  outputTokens: 0,
+                  reasoningTokens: 0,
+                },
+                unpricedRecords: 1,
+              }),
+              bucket({ model: "shared-model", hourStart: hourTwo, costUsd: 5, records: 3 }),
+            ],
+            [sharedClaude, { provider: "codex", hostId: "mac", homePath: "/home/theo/.codex" }],
+          ),
+        ),
+        environment(
+          "env-b",
+          summary(
+            [bucket({ model: "duplicate-model", hourStart: hourOne, costUsd: 99 })],
+            [sharedClaude],
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    const firstHour = merged.hourly[0];
+    expect(firstHour?.byModel).toEqual(
+      new Map([
+        [
+          "claude:shared-model",
+          {
+            model: "shared-model",
+            provider: "claude",
+            costUsd: 3,
+            totalTokens: 1160,
+            records: 2,
+          },
+        ],
+        [
+          "codex:shared-model",
+          {
+            model: "shared-model",
+            provider: "codex",
+            costUsd: 4,
+            totalTokens: 1160,
+            records: 1,
+          },
+        ],
+        [
+          "claude:free-model",
+          {
+            model: "free-model",
+            provider: "claude",
+            costUsd: 0,
+            totalTokens: 0,
+            records: 1,
+          },
+        ],
+      ]),
+    );
+    expect(firstHour?.byModel.has("claude:duplicate-model")).toBe(false);
+    expect(merged.hourly[1]?.byModel.get("claude:shared-model")).toEqual({
+      model: "shared-model",
+      provider: "claude",
+      costUsd: 5,
+      totalTokens: 1160,
+      records: 3,
+    });
   });
 });

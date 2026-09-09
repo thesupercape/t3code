@@ -2,6 +2,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
 
@@ -30,16 +31,17 @@ const makeRuntimeSqliteLayer = Effect.fn("makeRuntimeSqliteLayer")(function* (
   return clientModule.layer(config);
 }, Layer.unwrap);
 
-const setup = Layer.effectDiscard(
+const connectionSetup = Layer.effectDiscard(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     // CLI and server write from separate processes; wait rather than fail with SQLITE_BUSY.
     yield* sql`PRAGMA busy_timeout = 5000;`;
     yield* sql`PRAGMA foreign_keys = ON;`;
     yield* sql`PRAGMA journal_mode = WAL;`;
-    yield* runMigrations();
   }),
 );
+
+const setup = Layer.effectDiscard(runMigrations()).pipe(Layer.provideMerge(connectionSetup));
 
 export const makeSqlitePersistenceLive = Effect.fn("makeSqlitePersistenceLive")(function* (
   dbPath: string,
@@ -69,5 +71,28 @@ export const layerConfig = Layer.unwrap(
   Effect.gen(function* () {
     const { dbPath } = yield* ServerConfig;
     return makeSqlitePersistenceLive(dbPath);
+  }),
+);
+
+class ExistingDatabaseInvalidError extends Schema.TaggedError<ExistingDatabaseInvalidError>()(
+  "ExistingDatabaseInvalidError",
+  { dbPath: Schema.String },
+) {}
+
+/** Agent CLI sessions use the running server's schema; they never migrate it. */
+export const makeExistingSqlitePersistenceLive = Effect.fn("makeExistingSqlitePersistenceLive")(
+  function* (dbPath: string) {
+    const fs = yield* FileSystem.FileSystem;
+    const info = yield* fs.stat(dbPath);
+    if (info.type !== "File") return yield* new ExistingDatabaseInvalidError({ dbPath });
+    return connectionSetup.pipe(Layer.provideMerge(makeRuntimeSqliteLayer({ filename: dbPath })));
+  },
+  Layer.unwrap,
+);
+
+export const existingLayerConfig = Layer.unwrap(
+  Effect.gen(function* () {
+    const { dbPath } = yield* ServerConfig;
+    return makeExistingSqlitePersistenceLive(dbPath);
   }),
 );

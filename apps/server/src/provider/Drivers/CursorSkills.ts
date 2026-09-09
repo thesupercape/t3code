@@ -135,7 +135,8 @@ const discoverSkillsInRoot = Effect.fn("discoverCursorSkillsInRoot")(function* (
   const path = yield* Path.Path;
   const skills: ServerProviderSkill[] = [];
   if (input.budget.exhausted) return skills;
-  const rootDirectory = yield* orUndefined(fileSystem.realPath(input.directory), input.budget);
+  const displayRoot = path.resolve(input.directory);
+  const rootDirectory = yield* orUndefined(fileSystem.realPath(displayRoot), input.budget);
   if (!rootDirectory) return skills;
   const visitedDirectories = new Set<string>();
 
@@ -211,7 +212,9 @@ const discoverSkillsInRoot = Effect.fn("discoverCursorSkillsInRoot")(function* (
     }
   });
 
-  yield* visit(rootDirectory, 0);
+  // Keep the lexical root for returned skill paths while using real paths for
+  // containment and symlink traversal decisions.
+  yield* visit(displayRoot, 0);
   return skills;
 });
 

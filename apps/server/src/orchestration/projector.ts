@@ -1,15 +1,17 @@
-import type { OrchestrationEvent, OrchestrationReadModel, ThreadId } from "@t3tools/contracts";
+import type {
+  MessageId,
+  OrchestrationEvent,
+  OrchestrationReadModel,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
-  isImportedAgentSessionMessageId,
   OrchestrationCheckpointSummary,
   OrchestrationMessage,
   OrchestrationSession,
   OrchestrationThread,
 } from "@t3tools/contracts";
-import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
-import * as Predicate from "effect/Predicate";
 
 import { toProjectorDecodeError, type OrchestrationProjectorDecodeError } from "./Errors.ts";
 import {
@@ -21,6 +23,8 @@ import {
   ThreadArchivedPayload,
   ThreadCreatedPayload,
   ThreadDeletedPayload,
+  ThreadEditFromHereFinishedPayload,
+  ThreadEditFromHereRequestedPayload,
   ThreadInteractionModeSetPayload,
   ThreadMetaUpdatedPayload,
   ThreadProposedPlanUpsertedPayload,
@@ -42,31 +46,9 @@ type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
 const MAX_THREAD_MESSAGES = 2_000;
 const MAX_THREAD_CHECKPOINTS = 500;
 
-// Async questions can stay open while the agent produces more activity.
-// Match the database snapshot's pending-question retention.
-function retainThreadActivities(activities: OrchestrationThread["activities"]) {
-  const recentStart = activities.length - 500;
-  if (recentStart <= 0) return activities;
-  const pending = new Map<string, OrchestrationThread["activities"][number]>();
-  for (const activity of activities) {
-    if (!Predicate.isObject(activity.payload)) continue;
-    const requestId = activity.payload.requestId;
-    if (typeof requestId !== "string") continue;
-    if (activity.kind === "user-input.requested" && activity.payload.responseMode === "message") {
-      pending.set(requestId, activity);
-    } else if (activity.kind === "user-input.resolved") {
-      pending.delete(requestId);
-    }
-  }
-  const pendingActivities = new Set(pending.values());
-  return activities.filter(
-    (activity, index) => index >= recentStart || pendingActivities.has(activity),
-  );
-}
-
 function checkpointStatusToLatestTurnState(status: "ready" | "missing" | "error") {
   if (status === "error") return "error" as const;
-  // Match SQL and client projections: a missing git ref is not an interruption.
+  if (status === "missing") return "interrupted" as const;
   return "completed" as const;
 }
 
@@ -116,10 +98,18 @@ function retainThreadMessagesAfterRevert(
   messages: ReadonlyArray<OrchestrationMessage>,
   retainedTurnIds: ReadonlySet<string>,
   turnCount: number,
+  sourceMessageId?: MessageId,
 ): ReadonlyArray<OrchestrationMessage> {
+  if (sourceMessageId !== undefined) {
+    const sourceIndex = messages.findIndex((message) => message.id === sourceMessageId);
+    if (sourceIndex >= 0) {
+      return messages.filter((message, index) => message.role === "system" || index < sourceIndex);
+    }
+  }
+
   const retainedMessageIds = new Set<string>();
   for (const message of messages) {
-    if (message.role === "system" || isImportedAgentSessionMessageId(message.id)) {
+    if (message.role === "system") {
       retainedMessageIds.add(message.id);
       continue;
     }
@@ -129,10 +119,7 @@ function retainThreadMessagesAfterRevert(
   }
 
   const retainedUserCount = messages.filter(
-    (message) =>
-      message.role === "user" &&
-      !isImportedAgentSessionMessageId(message.id) &&
-      retainedMessageIds.has(message.id),
+    (message) => message.role === "user" && retainedMessageIds.has(message.id),
   ).length;
   const missingUserCount = Math.max(0, turnCount - retainedUserCount);
   if (missingUserCount > 0) {
@@ -145,8 +132,7 @@ function retainThreadMessagesAfterRevert(
       )
       .toSorted(
         (left, right) =>
-          compareDateTimeStrings(left.createdAt, right.createdAt) ||
-          left.id.localeCompare(right.id),
+          left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
       .slice(0, missingUserCount);
     for (const message of fallbackUserMessages) {
@@ -155,10 +141,7 @@ function retainThreadMessagesAfterRevert(
   }
 
   const retainedAssistantCount = messages.filter(
-    (message) =>
-      message.role === "assistant" &&
-      !isImportedAgentSessionMessageId(message.id) &&
-      retainedMessageIds.has(message.id),
+    (message) => message.role === "assistant" && retainedMessageIds.has(message.id),
   ).length;
   const missingAssistantCount = Math.max(0, turnCount - retainedAssistantCount);
   if (missingAssistantCount > 0) {
@@ -171,8 +154,7 @@ function retainThreadMessagesAfterRevert(
       )
       .toSorted(
         (left, right) =>
-          compareDateTimeStrings(left.createdAt, right.createdAt) ||
-          left.id.localeCompare(right.id),
+          left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
       )
       .slice(0, missingAssistantCount);
     for (const message of fallbackAssistantMessages) {
@@ -186,7 +168,11 @@ function retainThreadMessagesAfterRevert(
 function retainThreadActivitiesAfterRevert(
   activities: ReadonlyArray<OrchestrationThread["activities"][number]>,
   retainedTurnIds: ReadonlySet<string>,
+  cutoffCreatedAt?: string,
 ): ReadonlyArray<OrchestrationThread["activities"][number]> {
+  if (cutoffCreatedAt !== undefined) {
+    return activities.filter((activity) => activity.createdAt < cutoffCreatedAt);
+  }
   return activities.filter(
     (activity) => activity.turnId === null || retainedTurnIds.has(activity.turnId),
   );
@@ -195,7 +181,11 @@ function retainThreadActivitiesAfterRevert(
 function retainThreadProposedPlansAfterRevert(
   proposedPlans: ReadonlyArray<OrchestrationThread["proposedPlans"][number]>,
   retainedTurnIds: ReadonlySet<string>,
+  cutoffCreatedAt?: string,
 ): ReadonlyArray<OrchestrationThread["proposedPlans"][number]> {
+  if (cutoffCreatedAt !== undefined) {
+    return proposedPlans.filter((proposedPlan) => proposedPlan.createdAt < cutoffCreatedAt);
+  }
   return proposedPlans.filter(
     (proposedPlan) => proposedPlan.turnId === null || retainedTurnIds.has(proposedPlan.turnId),
   );
@@ -248,13 +238,12 @@ export function projectEvent(
             workspaceRoot: payload.workspaceRoot,
             defaultModelSelection: payload.defaultModelSelection,
             defaultThreadEnvMode: null,
-            autoPull: false,
             faviconPath: payload.faviconPath ?? null,
-            projectIcon: payload.projectIcon ?? null,
             scripts: payload.scripts,
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
             deletedAt: null,
+            editFromHere: null,
           };
 
           return {
@@ -286,12 +275,8 @@ export function projectEvent(
                   ...(payload.defaultThreadEnvMode !== undefined
                     ? { defaultThreadEnvMode: payload.defaultThreadEnvMode }
                     : {}),
-                  ...(payload.autoPull !== undefined ? { autoPull: payload.autoPull } : {}),
                   ...(payload.faviconPath !== undefined
                     ? { faviconPath: payload.faviconPath }
-                    : {}),
-                  ...(payload.projectIcon !== undefined
-                    ? { projectIcon: payload.projectIcon }
                     : {}),
                   ...(payload.scripts !== undefined ? { scripts: payload.scripts } : {}),
                   updatedAt: payload.updatedAt,
@@ -336,15 +321,12 @@ export function projectEvent(
             interactionMode: payload.interactionMode,
             branch: payload.branch,
             worktreePath: payload.worktreePath,
-            branchPullRequest: null,
             latestTurn: null,
             createdAt: payload.createdAt,
             updatedAt: payload.updatedAt,
             archivedAt: null,
             settledOverride: null,
             settledAt: null,
-            unsettledAt: null,
-            activeOrderKey: null,
             snoozedUntil: null,
             snoozedAt: null,
             deletedAt: null,
@@ -406,7 +388,6 @@ export function projectEvent(
           threads: updateThread(nextBase.threads, payload.threadId, {
             settledOverride: "settled",
             settledAt: payload.settledAt,
-            unsettledAt: null,
             activeOrderKey: null,
             updatedAt: payload.updatedAt,
           }),
@@ -415,24 +396,14 @@ export function projectEvent(
 
     case "thread.unsettled":
       return decodeForEvent(ThreadUnsettledPayload, event.payload, event.type, "payload").pipe(
-        Effect.map((payload) => {
-          const existing = nextBase.threads.find((thread) => thread.id === payload.threadId);
-          return {
-            ...nextBase,
-            threads: updateThread(nextBase.threads, payload.threadId, {
-              settledOverride: payload.reason === "user" ? "active" : null,
-              settledAt: null,
-              // Re-entry stamp for active-list ordering. A thread already
-              // pinned active keeps its stamp: the activity reset that clears
-              // the pin is not a re-entry and must not reorder the list.
-              unsettledAt:
-                existing?.settledOverride === "active"
-                  ? (existing.unsettledAt ?? null)
-                  : payload.updatedAt,
-              updatedAt: payload.updatedAt,
-            }),
-          };
-        }),
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            settledOverride: payload.reason === "user" ? "active" : null,
+            settledAt: null,
+            updatedAt: payload.updatedAt,
+          }),
+        })),
       );
 
     case "thread.snoozed":
@@ -502,9 +473,6 @@ export function projectEvent(
           ...nextBase,
           threads: updateThread(nextBase.threads, payload.threadId, {
             ...(payload.title !== undefined ? { title: payload.title } : {}),
-            ...(payload.activeOrderKey !== undefined
-              ? { activeOrderKey: payload.activeOrderKey }
-              : {}),
             ...(payload.titleRegeneration !== undefined
               ? { titleRegeneration: payload.titleRegeneration }
               : {}),
@@ -513,11 +481,8 @@ export function projectEvent(
               : {}),
             ...(payload.branch !== undefined ? { branch: payload.branch } : {}),
             ...(payload.worktreePath !== undefined ? { worktreePath: payload.worktreePath } : {}),
-            ...(payload.linkedPullRequest !== undefined
-              ? { linkedPullRequest: payload.linkedPullRequest }
-              : {}),
-            ...(payload.branchPullRequest !== undefined
-              ? { branchPullRequest: payload.branchPullRequest }
+            ...(payload.activeOrderKey !== undefined
+              ? { activeOrderKey: payload.activeOrderKey }
               : {}),
             updatedAt: payload.updatedAt,
           }),
@@ -765,11 +730,7 @@ export function projectEvent(
               ? thread.latestTurn
               : {
                   turnId: payload.turnId,
-                  state:
-                    thread.latestTurn?.turnId === payload.turnId &&
-                    thread.latestTurn.state === "interrupted"
-                      ? "interrupted"
-                      : checkpointStatusToLatestTurnState(payload.status),
+                  state: checkpointStatusToLatestTurnState(payload.status),
                   requestedAt:
                     thread.latestTurn?.turnId === payload.turnId
                       ? thread.latestTurn.requestedAt
@@ -793,22 +754,46 @@ export function projectEvent(
           if (!thread) {
             return nextBase;
           }
+          if (
+            payload.editFromHereRequestId !== undefined &&
+            thread.editFromHere?.requestId !== payload.editFromHereRequestId
+          ) {
+            return nextBase;
+          }
 
           const checkpoints = thread.checkpoints
             .filter((entry) => entry.checkpointTurnCount <= payload.turnCount)
             .toSorted((left, right) => left.checkpointTurnCount - right.checkpointTurnCount)
             .slice(-MAX_THREAD_CHECKPOINTS);
           const retainedTurnIds = new Set(checkpoints.map((checkpoint) => checkpoint.turnId));
-          const messages = retainThreadMessagesAfterRevert(
+          const revertedMessages = retainThreadMessagesAfterRevert(
             thread.messages,
             retainedTurnIds,
             payload.turnCount,
-          ).slice(-MAX_THREAD_MESSAGES);
+            payload.sourceMessageId,
+          );
+          // Imported history is immutable context and has no turn id, so a
+          // revert to turn zero must not erase it along with live turns.
+          const importedMessages = thread.messages.filter((message) =>
+            message.id.startsWith("import:"),
+          );
+          const retainedMessageIds = new Set([
+            ...revertedMessages.map((message) => message.id),
+            ...importedMessages.map((message) => message.id),
+          ]);
+          const messages = thread.messages
+            .filter((message) => retainedMessageIds.has(message.id))
+            .slice(-MAX_THREAD_MESSAGES);
           const proposedPlans = retainThreadProposedPlansAfterRevert(
             thread.proposedPlans,
             retainedTurnIds,
+            payload.cutoffCreatedAt,
           ).slice(-200);
-          const activities = retainThreadActivitiesAfterRevert(thread.activities, retainedTurnIds);
+          const activities = retainThreadActivitiesAfterRevert(
+            thread.activities,
+            retainedTurnIds,
+            payload.cutoffCreatedAt,
+          );
 
           const latestCheckpoint = checkpoints.at(-1) ?? null;
           const latestTurn =
@@ -837,6 +822,50 @@ export function projectEvent(
         }),
       );
 
+    case "thread.edit-from-here-requested":
+      return decodeForEvent(
+        ThreadEditFromHereRequestedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          threads: updateThread(nextBase.threads, payload.threadId, {
+            editFromHere: {
+              requestId: payload.requestId,
+              mode: payload.mode,
+              sourceMessageId: payload.sourceMessageId,
+              ...(payload.targetThreadId !== undefined
+                ? { targetThreadId: payload.targetThreadId }
+                : {}),
+              startedAt: payload.createdAt,
+            },
+            updatedAt: event.occurredAt,
+          }),
+        })),
+      );
+
+    case "thread.edit-from-here-finished":
+      return decodeForEvent(
+        ThreadEditFromHereFinishedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
+          if (!thread || thread.editFromHere?.requestId !== payload.requestId) return nextBase;
+          return {
+            ...nextBase,
+            threads: updateThread(nextBase.threads, payload.threadId, {
+              editFromHere: null,
+              updatedAt: payload.finishedAt,
+            }),
+          };
+        }),
+      );
+
     case "thread.activity-appended":
       return decodeForEvent(
         ThreadActivityAppendedPayload,
@@ -850,12 +879,12 @@ export function projectEvent(
             return nextBase;
           }
 
-          const activities = retainThreadActivities(
-            [
-              ...thread.activities.filter((entry) => entry.id !== payload.activity.id),
-              payload.activity,
-            ].toSorted(compareThreadActivities),
-          );
+          const activities = [
+            ...thread.activities.filter((entry) => entry.id !== payload.activity.id),
+            payload.activity,
+          ]
+            .toSorted(compareThreadActivities)
+            .slice(-500);
 
           return {
             ...nextBase,

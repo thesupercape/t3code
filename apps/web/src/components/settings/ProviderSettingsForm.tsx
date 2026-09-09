@@ -93,6 +93,10 @@ export function deriveProviderSettingsFields(
     })
     .flatMap(({ key }) => {
       const fieldSchema = definition.settingsSchema.fields[key]!;
+      // The desktop daemon selector is an internal transport choice. It is
+      // persisted with provider config for desktop builds, but it is not a
+      // user-facing provider setting and must not leak into this form.
+      if (key === "useDesktopAppDaemon") return [];
       const formAnnotation = readProviderSettingsFormAnnotation(fieldSchema);
       if (formAnnotation.hidden) return [];
 

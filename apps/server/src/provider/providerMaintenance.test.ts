@@ -253,6 +253,7 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           "@example",
           "package-tool",
         ]);
+        const realTempDir = NodeFS.realpathSync(tempDir);
 
         const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
           packageToolUpdate,
@@ -266,17 +267,17 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
           provider: driver("packageTool"),
           packageName: "@example/package-tool",
           update: {
-            command: `npm install -g --prefix ${tempDir} --allow-scripts=@example/package-tool @example/package-tool@latest`,
+            command: `npm install -g --prefix ${realTempDir} --allow-scripts=@example/package-tool @example/package-tool@latest`,
             executable: "npm",
             args: [
               "install",
               "-g",
               "--prefix",
-              tempDir,
+              realTempDir,
               "--allow-scripts=@example/package-tool",
               "@example/package-tool@latest",
             ],
-            lockKey: `npm-global:${normalizeCommandPath(tempDir)}`,
+            lockKey: `npm-global:${normalizeCommandPath(realTempDir)}`,
           },
         });
       }),
@@ -528,6 +529,7 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
         const link = NodePath.join(tempDir, "bin", "package-tool");
         NodeFS.mkdirSync(NodePath.dirname(link), { recursive: true });
         NodeFS.symlinkSync(target, link);
+        const realKeg = NodeFS.realpathSync(keg);
 
         const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(
           packageToolUpdate,
@@ -539,8 +541,8 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
 
         expect(capabilities.update).toMatchObject({
           executable: "npm",
-          args: expect.arrayContaining(["--prefix", keg]),
-          lockKey: `npm-global:${normalizeCommandPath(keg)}`,
+          args: expect.arrayContaining(["--prefix", realKeg]),
+          lockKey: `npm-global:${normalizeCommandPath(realKeg)}`,
         });
       }),
   );

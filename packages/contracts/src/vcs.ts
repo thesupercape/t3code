@@ -83,9 +83,29 @@ export type VcsProcessExitFailureKind = typeof VcsProcessExitFailureKind.Type;
 
 export interface VcsProcessExitFailure {
   readonly exitCode: number;
+  readonly stdout: string;
   readonly stderr: string;
+  readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
 }
+
+const PROCESS_ERROR_OUTPUT_LIMIT = 4_096;
+
+const sanitizeProcessErrorOutput = (value: string, truncated: boolean): string => {
+  const redacted = value
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, "$1[REDACTED]")
+    .replace(/(bearer\s+)[^\s]+/gi, "$1[REDACTED]")
+    .replace(/(token|password|passwd|secret|api[_-]?key)\s*[=:]\s*[^\s,;]+/gi, "$1=[REDACTED]")
+    .replace(/gh[pousr]_[A-Za-z0-9_]+/g, "[REDACTED]")
+    .replace(/github_pat_[A-Za-z0-9_]+/g, "[REDACTED]");
+  const bounded =
+    redacted.length > PROCESS_ERROR_OUTPUT_LIMIT
+      ? `${redacted.slice(0, PROCESS_ERROR_OUTPUT_LIMIT)}\n[output capped]`
+      : redacted;
+  return truncated && !bounded.includes("[output capped]")
+    ? `${bounded}\n[output truncated]`
+    : bounded;
+};
 
 export class VcsProcessSpawnError extends Schema.TaggedError<VcsProcessSpawnError>()(
   "VcsProcessSpawnError",
@@ -119,6 +139,9 @@ export class VcsProcessExitError extends Schema.TaggedError<VcsProcessExitError>
     exitCode: Schema.Number,
     detail: Schema.String,
     failureKind: Schema.optional(VcsProcessExitFailureKind),
+    stdout: Schema.optional(Schema.String),
+    stdoutTruncated: Schema.optional(Schema.Boolean),
+    stderr: Schema.optional(Schema.String),
     stderrLength: Schema.optional(NonNegativeInt),
     stderrTruncated: Schema.optional(Schema.Boolean),
   },
@@ -150,6 +173,9 @@ export class VcsProcessExitError extends Schema.TaggedError<VcsProcessExitError>
       exitCode: error.exitCode,
       detail,
       failureKind,
+      stdout: sanitizeProcessErrorOutput(error.stdout, error.stdoutTruncated),
+      stdoutTruncated: error.stdoutTruncated,
+      stderr: sanitizeProcessErrorOutput(error.stderr, error.stderrTruncated),
       stderrLength: error.stderr.length,
       stderrTruncated: error.stderrTruncated,
     });

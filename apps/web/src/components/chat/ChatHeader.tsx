@@ -11,7 +11,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDownIcon, MoreHorizontalIcon } from "lucide-react";
 import {
   memo,
   useCallback,
@@ -21,6 +21,7 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type ReactNode,
 } from "react";
 import GitActionsControl from "../GitActionsControl";
 import { isTrailingDoubleClick } from "../Sidebar.logic";
@@ -47,6 +48,8 @@ import {
   WorkspaceBreadcrumbSeparator,
 } from "../WorkspaceBreadcrumb";
 import { cn } from "~/lib/utils";
+import { Button } from "../ui/button";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
@@ -73,6 +76,52 @@ interface ChatHeaderProps {
     input: NewProjectScriptInput,
   ) => Promise<ProjectScriptActionResult>;
   onDeleteProjectScript: (scriptId: string) => Promise<ProjectScriptActionResult>;
+}
+
+export function CompactTaskActions({
+  open,
+  onOpenChange,
+  reservePanelControls,
+  children,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  reservePanelControls: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      data-mobile-chat-header-actions
+      className={cn(
+        "no-drag relative flex shrink-0 @xl/header-actions:hidden",
+        reservePanelControls ? "mr-[4.5rem]" : "mr-0",
+      )}
+    >
+      <Popover open={open} onOpenChange={onOpenChange}>
+        <PopoverTrigger
+          aria-label="Task actions"
+          render={
+            <Button
+              size="icon-xl"
+              variant="ghost"
+              className="size-11"
+              title="Task actions"
+              data-mobile-header-overflow
+            />
+          }
+        >
+          <MoreHorizontalIcon aria-hidden className="size-5" strokeWidth={2.25} />
+        </PopoverTrigger>
+        <PopoverPopup
+          align="end"
+          className="w-[min(19rem,calc(100vw-env(safe-area-inset-left)-env(safe-area-inset-right)-1rem))]"
+          viewportClassName="p-2"
+        >
+          {children}
+        </PopoverPopup>
+      </Popover>
+    </div>
+  );
 }
 
 /**

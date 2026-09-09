@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  PREVIEW_AUTOMATION_OPERATIONS,
   PreviewAutomationClientDisconnectedError,
   PreviewAutomationInvalidSelectorError,
   PreviewAutomationMalformedResponseError,
@@ -17,6 +18,8 @@ import {
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 
@@ -57,6 +60,79 @@ const requestsFrom = (
     }),
   );
 
+const connectAndWait = Effect.fn(function* (
+  broker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  host: PreviewAutomationHost,
+) {
+  const connected = yield* Deferred.make<string>();
+  const events = yield* broker.connect(host);
+  const fiber = yield* events.pipe(
+    Stream.runForEach((event) =>
+      event.type === "connected" ? Deferred.succeed(connected, event.connectionId) : Effect.void,
+    ),
+    Effect.forkScoped,
+  );
+  return { fiber, connectionId: yield* Deferred.await(connected) };
+});
+
+it.effect("advertises only consumed browser hosts in the requested environment", () =>
+  Effect.gen(function* () {
+    const broker = yield* makeBroker;
+    const unconsumed = yield* broker.connect(makeHost());
+    expect(unconsumed).toBeDefined();
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(false);
+
+    yield* connectAndWait(broker, makeHost({ environmentId: EnvironmentId.make("elsewhere") }));
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(false);
+    yield* connectAndWait(
+      broker,
+      makeHost({ clientId: "partial-a", supportedOperations: ["status", "open", "navigate"] }),
+    );
+    yield* connectAndWait(
+      broker,
+      makeHost({ clientId: "partial-b", supportedOperations: ["snapshot", "click", "type"] }),
+    );
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(false);
+
+    const host = yield* connectAndWait(broker, makeHost({ clientId: "complete" }));
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(true);
+    expect(
+      yield* broker.streamBrowserAvailability(scope.environmentId).pipe(Stream.runHead),
+    ).toEqual(Option.some(true));
+    yield* Fiber.interrupt(host.fiber);
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("streams readiness across replacement and last-host disconnect without focus churn", () =>
+  Effect.gen(function* () {
+    const broker = yield* makeBroker;
+    const changes = yield* Queue.unbounded<boolean>();
+    yield* broker.streamBrowserAvailability(scope.environmentId).pipe(
+      Stream.runForEach((available) => Queue.offer(changes, available)),
+      Effect.forkScoped,
+    );
+    expect(yield* Queue.take(changes)).toBe(false);
+    const first = yield* connectAndWait(broker, makeHost());
+    expect(yield* Queue.take(changes)).toBe(true);
+    yield* broker.focusHost({ ...makeHost(), connectionId: first.connectionId, focused: true });
+    const replacement = yield* connectAndWait(broker, makeHost());
+    yield* Fiber.await(first.fiber);
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(true);
+    const second = yield* connectAndWait(broker, makeHost({ clientId: "second" }));
+    yield* Fiber.interrupt(replacement.fiber);
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(true);
+    yield* Fiber.interrupt(second.fiber);
+    expect(yield* Queue.take(changes)).toBe(false);
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(false);
+
+    const reconnected = yield* connectAndWait(broker, makeHost());
+    expect(yield* Queue.take(changes)).toBe(true);
+    yield* Fiber.interrupt(reconnected.fiber);
+    expect(yield* Queue.take(changes)).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
 it.effect("atomically registers a connected host and correlates its response", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -82,6 +158,46 @@ it.effect("atomically registers a connected host and correlates its response", (
       expect(result).toEqual({ available: true });
     }),
   ),
+);
+
+it.effect("pins new browser sessions to a core-complete host before a larger partial host", () =>
+  Effect.gen(function* () {
+    const broker = yield* makeBroker;
+    for (const host of [
+      makeHost({ clientId: "complete" }),
+      makeHost({
+        clientId: "partial",
+        supportedOperations: PREVIEW_AUTOMATION_OPERATIONS.filter(
+          (operation) => operation !== "click",
+        ),
+      }),
+    ]) {
+      const connected = yield* Deferred.make<void>();
+      const events = yield* broker.connect(host);
+      yield* events.pipe(
+        Stream.runForEach((event) =>
+          event.type === "connected"
+            ? Deferred.succeed(connected, undefined)
+            : broker.respond({
+                clientId: host.clientId,
+                connectionId: event.connectionId,
+                requestId: event.request.requestId,
+                ok: true,
+                result: { clientId: host.clientId },
+              }),
+        ),
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(connected);
+    }
+    expect(yield* broker.isBrowserAvailable(scope.environmentId)).toBe(true);
+    expect(yield* broker.invoke({ scope, operation: "status", input: {} })).toEqual({
+      clientId: "complete",
+    });
+    expect(yield* broker.invoke({ scope, operation: "click", input: {} })).toEqual({
+      clientId: "complete",
+    });
+  }).pipe(Effect.scoped),
 );
 
 it.effect("targets multiple tabs explicitly while retaining a default tab", () =>

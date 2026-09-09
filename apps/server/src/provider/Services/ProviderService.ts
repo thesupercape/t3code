@@ -25,6 +25,7 @@ import type {
   ProviderUploadFeedbackResult,
   MessageId,
   ThreadId,
+  TurnId,
   ProviderTurnStartResult,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -54,7 +55,8 @@ export interface ProviderServiceShape {
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 
-  readonly compactThread: (
+  /** Compact the active provider conversation and await its terminal event. */
+  readonly compactThread?: (
     threadId: ThreadId,
     modelSelection?: ProviderSendTurnInput["modelSelection"],
     requestId?: MessageId,
@@ -107,19 +109,20 @@ export interface ProviderServiceShape {
   ) => Effect.Effect<ProviderInstanceRoutingInfo, ProviderServiceError>;
 
   /**
-   * Reject unsupported rewind before files change, without resuming the session.
-   */
-  readonly assertConversationRollbackSupported: (
-    threadId: ThreadId,
-  ) => Effect.Effect<void, ProviderServiceError>;
-
-  /**
    * Roll back provider conversation state by a number of turns.
    */
   readonly rollbackConversation: (input: {
     readonly threadId: ThreadId;
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
+
+  /** Start a target session from an inclusive provider turn boundary. */
+  readonly forkConversation: (input: {
+    readonly sourceThreadId: ThreadId;
+    readonly targetThreadId: ThreadId;
+    readonly lastTurnId: TurnId;
+    readonly startSession: ProviderSessionStartInput;
+  }) => Effect.Effect<ProviderSession, ProviderServiceError>;
 
   /**
    * Upload a thread and return the provider's shareable feedback identifier.

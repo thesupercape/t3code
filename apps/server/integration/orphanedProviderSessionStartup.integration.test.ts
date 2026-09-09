@@ -113,17 +113,16 @@ const startupDependencies = Layer.mergeAll(
   Layer.succeed(ProviderService.ProviderService, {
     startSession: () => Effect.die("unused"),
     sendTurn: () => Effect.die("unused"),
-    compactThread: () => Effect.die("unused"),
     interruptTurn: () => Effect.die("unused"),
     respondToRequest: () => Effect.die("unused"),
     respondToUserInput: () => Effect.die("unused"),
     stopSession: () => Effect.die("unused"),
     listSessions: () => Effect.succeed([]),
     getCapabilities: () => Effect.die("unused"),
-    assertConversationRollbackSupported: () => Effect.die("unused"),
     getInstanceInfo: () => Effect.die("unused"),
     rollbackConversation: () => Effect.die("unused"),
     uploadFeedback: () => Effect.die("unused"),
+    forkConversation: () => Effect.die("unused"),
     streamEvents: Stream.empty,
   }),
 );
@@ -466,11 +465,13 @@ it.effect.each(["opt-in desktop restart", "marked remote update"] as const)(
         assert.equal(after.session?.status, "starting");
         assert.equal(after.session?.activeTurnId, null);
         assert.equal(after.session?.lastError, null);
-        assert.deepStrictEqual(yield* Deferred.await(sent), {
-          threadId,
-          continuation: true,
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        });
+        const sentInput = yield* Deferred.await(sent);
+        assert.equal(sentInput.threadId, threadId);
+        assert.equal(
+          (sentInput as typeof sentInput & { readonly continuation?: boolean }).continuation,
+          true,
+        );
+        assert.equal(sentInput.interactionMode, DEFAULT_PROVIDER_INTERACTION_MODE);
       }).pipe(
         Effect.provide(
           Layer.mergeAll(makePersistedRuntimeLayer(config.dbPath), startupDependencies),

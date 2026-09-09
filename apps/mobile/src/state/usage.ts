@@ -10,17 +10,18 @@
  * @module state/usage
  */
 import { useAtomValue } from "@effect/atom-react";
+import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
+import { usageQueryInput } from "@t3tools/client-runtime/usageRefresh";
 import {
   USAGE_CONTRACT_VERSION,
   type EnvironmentId,
   type UsageSummary,
   type UsageSummaryInput,
 } from "@t3tools/contracts";
-import { refreshUsage } from "@t3tools/client-runtime/state/usage";
 import { mergeUsage, type EnvironmentUsage, type MergedUsage } from "@t3tools/shared/usageMerge";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
-import { useCallback, useMemo } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import { appAtomRegistry } from "./atom-registry";
 import { environmentPresentations } from "./presentation";
@@ -30,7 +31,6 @@ export interface EnvironmentUsageStatus {
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly isPending: boolean;
-  readonly isConnected: boolean;
   readonly error: string | null;
   readonly summary: UsageSummary | null;
 }
@@ -54,7 +54,6 @@ const usageByWindowAtom = Atom.family((windowKey: string) =>
         environmentId,
         label: presentation.entry.target.label,
         isPending: result.waiting,
-        isConnected: presentation.connection.phase === "connected",
         error: result._tag === "Failure" ? "This environment could not report usage." : null,
         summary: Option.getOrNull(AsyncResult.value(result)),
       });
@@ -66,32 +65,20 @@ const usageByWindowAtom = Atom.family((windowKey: string) =>
 export interface UsageView {
   readonly merged: MergedUsage;
   readonly environments: readonly EnvironmentUsageStatus[];
-  readonly selectedEnvironments: readonly EnvironmentUsageStatus[];
   /** True until at least one environment has answered. */
   readonly isPending: boolean;
   /**
    * True while environments that have not failed are still answering. Failed
-   * environments are reported in the environment menu: totals will not
+   * environments are reported through their own error rows: totals will not
    * improve by waiting on them, so they must not read as "still reporting".
    */
   readonly isPartial: boolean;
-  readonly refresh: (input?: UsageSummaryInput) => Promise<void>;
+  readonly refresh: (input?: UsageSummaryInput) => Promise<readonly EnvironmentUsageStatus[]>;
 }
 
-export function useUsage(
-  input: UsageSummaryInput,
-  selectedEnvironmentIds: ReadonlySet<EnvironmentId> | null = null,
-): UsageView {
+export function useUsage(input: UsageSummaryInput): UsageView {
   const windowKey = useMemo(
-    () =>
-      JSON.stringify({
-        sinceDay: input.sinceDay,
-        untilDay: input.untilDay,
-        timeZone: input.timeZone,
-        resolution: input.resolution,
-        sinceTime: input.sinceTime,
-        untilTime: input.untilTime,
-      }),
+    () => JSON.stringify(usageQueryInput(input, USAGE_CONTRACT_VERSION)),
     [
       input.sinceDay,
       input.untilDay,
@@ -99,32 +86,43 @@ export function useUsage(
       input.resolution,
       input.sinceTime,
       input.untilTime,
+      input.includeQuotaHistory,
+      input.quotaHistoryOnly,
+      input.quotaIntervals,
     ],
   );
   const atom = usageByWindowAtom(windowKey);
   const environments = useAtomValue(atom);
-  const selectedEnvironments = useMemo(
-    () =>
-      selectedEnvironmentIds === null
-        ? environments
-        : environments.filter(({ environmentId }) => selectedEnvironmentIds.has(environmentId)),
-    [environments, selectedEnvironmentIds],
-  );
 
+  // Refreshing only the derived atom would re-read the per-environment SWR
+  // queries within their stale window and change nothing. Refresh each
+  // environment's query so pull-to-refresh always rescans.
   const refresh = useCallback(
-    (nextInput?: UsageSummaryInput) =>
-      refreshUsage({
-        registry: appAtomRegistry,
-        server: serverEnvironment,
-        presentations: environmentPresentations,
-        environmentIds: selectedEnvironments.map(({ environmentId }) => environmentId),
-        input: nextInput ?? (JSON.parse(windowKey) as UsageSummaryInput),
-      }),
-    [selectedEnvironments, windowKey],
+    async (nextInput?: UsageSummaryInput) => {
+      const input = nextInput
+        ? usageQueryInput(nextInput, USAGE_CONTRACT_VERSION)
+        : (JSON.parse(windowKey) as UsageSummaryInput);
+      return Promise.all(
+        environments.map(async (environment) => {
+          const result = await executeAtomQuery(
+            appAtomRegistry,
+            serverEnvironment.usageSummary({ environmentId: environment.environmentId, input }),
+            { refresh: true, timeoutMs: 30_000, reportFailure: false, reportDefect: false },
+          );
+          return {
+            ...environment,
+            isPending: false,
+            error: result._tag === "Failure" ? "This environment could not report usage." : null,
+            summary: Option.getOrNull(AsyncResult.value(result)),
+          };
+        }),
+      );
+    },
+    [environments, windowKey],
   );
 
   const merged = useMemo(() => {
-    const answered: EnvironmentUsage[] = selectedEnvironments.flatMap((environment) =>
+    const answered: EnvironmentUsage[] = environments.flatMap((environment) =>
       environment.summary === null
         ? []
         : [
@@ -136,19 +134,26 @@ export function useUsage(
           ],
     );
     return mergeUsage(answered, USAGE_CONTRACT_VERSION);
-  }, [selectedEnvironments]);
+  }, [environments]);
 
-  const answeredCount = selectedEnvironments.filter(
-    (environment) => environment.summary !== null,
-  ).length;
-  const stillReporting = selectedEnvironments.filter(
+  const hasDeferredTranscripts = environments.some((environment) =>
+    environment.summary?.sources.some((source) => source.status === "partial"),
+  );
+  useEffect(() => {
+    if (!hasDeferredTranscripts || environments.some((environment) => environment.isPending))
+      return;
+    const timer = setTimeout(() => void refresh(), 750);
+    return () => clearTimeout(timer);
+  }, [environments, hasDeferredTranscripts, refresh]);
+
+  const answeredCount = environments.filter((environment) => environment.summary !== null).length;
+  const stillReporting = environments.filter(
     (environment) => environment.summary === null && environment.error === null,
   ).length;
 
   return {
     merged,
     environments,
-    selectedEnvironments,
     isPending: answeredCount === 0 && stillReporting > 0,
     isPartial: answeredCount > 0 && stillReporting > 0,
     refresh,

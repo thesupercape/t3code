@@ -1,5 +1,6 @@
 import {
-  type CustomModelSetting,
+  DEFAULT_MODEL,
+  DEFAULT_MODEL_BY_PROVIDER,
   MODEL_SLUG_ALIASES_BY_PROVIDER,
   ModelCapabilities,
   type ModelSelection,
@@ -7,6 +8,7 @@ import {
   ProviderInstanceId,
   type ProviderOptionDescriptor,
   type ProviderOptionSelection,
+  type CustomModelSetting,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -21,9 +23,11 @@ export interface SelectableModelOption {
 
 export function createModelCapabilities(input: {
   optionDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
+  subagentBackends?: ModelCapabilities["subagentBackends"];
 }): ModelCapabilities {
   return {
     optionDescriptors: input.optionDescriptors.map(cloneDescriptor),
+    ...(input.subagentBackends ? { subagentBackends: input.subagentBackends } : {}),
   };
 }
 
@@ -35,7 +39,7 @@ function getRawSelectionValueById(
   return selection?.value;
 }
 
-function getProviderOptionSelectionValue(
+export function getProviderOptionSelectionValue(
   selections: ReadonlyArray<ProviderOptionSelection> | null | undefined,
   id: string,
 ): string | boolean | undefined {
@@ -56,6 +60,13 @@ export function getProviderOptionBooleanSelectionValue(
 ): boolean | undefined {
   const value = getProviderOptionSelectionValue(selections, id);
   return typeof value === "boolean" ? value : undefined;
+}
+
+export function getModelSelectionOptionValue(
+  modelSelection: ModelSelection | null | undefined,
+  id: string,
+): string | boolean | undefined {
+  return getProviderOptionSelectionValue(modelSelection?.options, id);
 }
 
 export function getModelSelectionStringOptionValue(
@@ -211,14 +222,26 @@ export function buildExplicitProviderOptionSelectionsFromDescriptors(
   descriptors: ReadonlyArray<ProviderOptionDescriptor> | null | undefined,
   selections: ReadonlyArray<ProviderOptionSelection> | null | undefined,
 ): Array<ProviderOptionSelection> | undefined {
-  if (!selections || selections.length === 0) {
-    return undefined;
+  if (!descriptors || !selections || selections.length === 0) return undefined;
+  const allowed = new Set(descriptors.map((descriptor) => descriptor.id));
+  const result = selections.filter((selection) => allowed.has(selection.id));
+  return result.length > 0 ? result.map((selection) => ({ ...selection })) : undefined;
+}
+
+export function getModelSelectionOptionDescriptors(
+  modelSelection: ModelSelection | null | undefined,
+  caps?: ModelCapabilities | null | undefined,
+): ReadonlyArray<ProviderOptionDescriptor> {
+  if (!modelSelection) {
+    return [];
   }
-  const explicitIds = new Set(selections.map((selection) => selection.id));
-  const normalized = buildProviderOptionSelectionsFromDescriptors(descriptors)?.filter(
-    (selection) => explicitIds.has(selection.id),
-  );
-  return normalized && normalized.length > 0 ? normalized : undefined;
+  if (!caps) {
+    return [];
+  }
+  return getProviderOptionDescriptors({
+    caps,
+    selections: modelSelection.options,
+  });
 }
 
 export function isClaudeUltrathinkPrompt(text: string | null | undefined): boolean {
@@ -250,7 +273,6 @@ export function normalizeCustomModelSlug(model: string | null | undefined): stri
   return model.trim() || null;
 }
 
-/** A custom model setting with its optional fields resolved. */
 export interface CustomModelDefinition {
   readonly slug: string;
   readonly name: string;
@@ -259,13 +281,6 @@ export interface CustomModelDefinition {
 
 const decodeCustomModelCapabilities = Schema.decodeUnknownOption(ModelCapabilities);
 
-/**
- * Read a `customModels` setting into resolved definitions. Accepts the typed
- * union as well as the opaque `providerInstances[id].config` blob clients see,
- * so it tolerates bare slugs, malformed rows, and unparseable capabilities
- * (dropped rather than failing the whole list). Slugs are trimmed and
- * deduplicated, first occurrence wins; `name` falls back to the slug.
- */
 export function readCustomModelEntries(value: unknown): CustomModelDefinition[] {
   if (!Array.isArray(value)) return [];
   const entries: CustomModelDefinition[] = [];
@@ -298,10 +313,10 @@ export function readCustomModelEntries(value: unknown): CustomModelDefinition[] 
   return entries;
 }
 
-/**
- * Write a definition back to the compact stored shape: a bare slug when it
- * carries nothing custom, otherwise an entry with only the set fields.
- */
+export function readCustomModelSlugs(value: unknown): string[] {
+  return readCustomModelEntries(value).map((entry) => entry.slug);
+}
+
 export function toCustomModelSetting(entry: CustomModelDefinition): CustomModelSetting {
   const descriptors = entry.capabilities?.optionDescriptors ?? [];
   const name = entry.name !== entry.slug ? entry.name : undefined;
@@ -355,8 +370,23 @@ export function resolveSelectableModel(
   return resolved ? resolved.slug : null;
 }
 
+function resolveModelSlug(model: string | null | undefined, provider: ProviderDriverKind): string {
+  const normalized = normalizeModelSlug(model, provider);
+  if (!normalized) {
+    return DEFAULT_MODEL_BY_PROVIDER[provider] ?? DEFAULT_MODEL;
+  }
+  return normalized;
+}
+
+export function resolveModelSlugForProvider(
+  provider: ProviderDriverKind,
+  model: string | null | undefined,
+): string {
+  return resolveModelSlug(model, provider);
+}
+
 /** Trim a string, returning null for empty/missing values. */
-function trimOrNull<T extends string>(value: T | null | undefined): T | null {
+export function trimOrNull<T extends string>(value: T | null | undefined): T | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim() as T;
   return trimmed || null;
@@ -412,11 +442,7 @@ export function applyClaudePromptEffortPrefix(
   if (!trimmed) {
     return trimmed;
   }
-  // Prefixing a slash command turns it into plain prose, so Claude never
-  // runs it. Command names come from arbitrary file names ("/deploy.prod",
-  // "/plugin:skill"), so accept any first token without a second slash;
-  // absolute paths like "/home/theo/app.ts" keep the prefix.
-  if (effort !== "ultrathink" || /^\/[^\s/]+(?:\s|$)/u.test(trimmed)) {
+  if (effort !== "ultrathink") {
     return trimmed;
   }
   if (trimmed.startsWith("Ultrathink:")) {

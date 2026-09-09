@@ -140,6 +140,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     sequence: 0,
     reason: "application-active",
   });
+  const wakeupsReady = yield* Deferred.make<void>();
   const closedSessions = yield* Ref.make<
     ReadonlyArray<Deferred.Deferred<never, ConnectionTransientError>>
   >([]);
@@ -193,6 +194,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
       ConnectionWakeups.ConnectionWakeups,
       ConnectionWakeups.ConnectionWakeups.of({
         changes: SubscriptionRef.changes(wakeups).pipe(
+          Stream.tap(() => Deferred.succeed(wakeupsReady, undefined)),
           Stream.drop(1),
           Stream.map((event) => event.reason),
         ),
@@ -209,6 +211,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     prepareCount,
     sessionCount,
     releaseCount,
+    wakeupsReady,
     setNetworkStatus: (status: NetworkStatus) => SubscriptionRef.set(networkStatus, status),
     wake: (reason: ConnectionWakeups.ConnectionWakeup) =>
       SubscriptionRef.update(wakeups, (event) => ({
@@ -887,6 +890,31 @@ describe("EnvironmentSupervisor", () => {
         (state) => state.phase === "connected" && state.generation === 2 && state.attempt === 1,
       );
     }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("reboots a connection after an initial bootstrap wakeup", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (attempt) => (attempt === 1 ? Effect.never : Effect.succeed(PREPARED_CONNECTION)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* eventuallyState(supervisor.state, (state) => state.phase === "connecting");
+      yield* Deferred.await(harness.wakeupsReady);
+      yield* harness.wake("application-bootstrap-retry");
+      yield* eventuallyState(
+        supervisor.state,
+        (state) => state.phase === "connected" && state.generation === 1 && state.attempt === 1,
+      );
+
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+      yield* harness.wake("application-bootstrap-retry");
+      yield* harness.wake("application-bootstrap-retry");
+      yield* Effect.yieldNow;
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+    }),
   );
 
   it.effect("probes the active session without reconnecting on application activation", () =>

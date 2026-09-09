@@ -1,210 +1,220 @@
-// @effect-diagnostics nodeBuiltinImport:off - resume coverage writes, appends
-// to, and truncates real transcript files byte-exactly, mirroring the reader's
-// own deliberate node:fs usage.
+// @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-import { afterEach, assert, beforeEach, describe, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 
-import { readTranscriptRecords } from "./usageTranscriptReader.ts";
+import {
+  readTranscriptRecords,
+  listTranscriptFiles,
+  selectTranscriptFilesForScan,
+  transcriptCursorIsLineBoundary,
+  type TranscriptFile,
+} from "./usageTranscriptReader.ts";
 
-let dir: string;
-
-beforeEach(async () => {
-  dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "usage-reader-test-"));
+const file = (path: string, size: number, mtimeMs: number): TranscriptFile => ({
+  path,
+  size,
+  mtimeMs,
 });
 
-afterEach(async () => {
-  await NodeFSP.rm(dir, { recursive: true, force: true });
+describe("selectTranscriptFilesForScan", () => {
+  it("selects newest cold files within the byte budget", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("old", 40, 1), file("new", 60, 3), file("middle", 50, 2)],
+      ({ size }) => size,
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual(["new", "old"]);
+    expect(selection.coldBytes).toBe(100);
+    expect(selection.deferredFiles).toBe(1);
+    expect(selection.deferredBytes).toBe(50);
+  });
+
+  it("always includes warm files without charging the cold budget", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("warm", 500, 3), file("cold", 100, 2)],
+      ({ path, size }) => (path === "warm" ? 0 : size),
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual(["warm", "cold"]);
+    expect(selection.coldBytes).toBe(100);
+    expect(selection.deferredFiles).toBe(0);
+  });
+
+  it("only charges the changed transcript when the rest are warm", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("unchanged-a", 500, 3), file("edited", 60, 2), file("unchanged-b", 400, 1)],
+      ({ path, size }) => (path !== "edited" ? 0 : size),
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual([
+      "unchanged-a",
+      "edited",
+      "unchanged-b",
+    ]);
+    expect(selection.coldBytes).toBe(60);
+    expect(selection.deferredFiles).toBe(0);
+  });
+
+  it("returns smaller files before an oversized transcript", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("oversized", 1_000, 3), file("small", 50, 2)],
+      ({ size }) => size,
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual(["small"]);
+    expect(selection.deferredFiles).toBe(1);
+    expect(selection.deferredBytes).toBe(1_000);
+    expect(selection.coldBytes).toBe(50);
+  });
+
+  it("selects one oversized transcript when it is the only cold work", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("oversized", 1_000, 3)],
+      ({ size }) => size,
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual(["oversized"]);
+    expect(selection.deferredFiles).toBe(0);
+    expect(selection.deferredBytes).toBe(0);
+    expect(selection.coldBytes).toBe(1_000);
+  });
+
+  it("selects a formerly oversized transcript after newer files become warm", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("new", 60, 3), file("oversized", 1_000, 2)],
+      ({ path, size }) => (path === "new" ? 0 : size),
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual(["new", "oversized"]);
+    expect(selection.deferredFiles).toBe(0);
+  });
+
+  it("does not starve oversized history while active rollouts only append", () => {
+    const selection = selectTranscriptFilesForScan(
+      [file("active", 2_000, 3), file("oversized", 1_000, 2), file("oversized-2", 900, 1)],
+      ({ path, size }) => (path === "active" ? 40 : size),
+      100,
+    );
+
+    expect(selection.files.map(({ path }) => path)).toEqual(["active", "oversized"]);
+    expect(selection.deferredFiles).toBe(1);
+    expect(selection.deferredBytes).toBe(900);
+    expect(selection.coldBytes).toBe(1_040);
+  });
+
+  it("budgets only appended bytes so growing large chats do not starve other files", () => {
+    const selection = selectTranscriptFilesForScan(
+      [
+        { ...file("active-large", 200_000_000, 3), startByte: 199_960_000 },
+        { ...file("active-small", 70_000_000, 2), startByte: 69_900_000 },
+        { ...file("cold", 50_000_000, 1), startByte: 0 },
+      ],
+      ({ size, startByte }) => size - startByte,
+      128 * 1024 * 1024,
+    );
+    expect(selection.files.map(({ path }) => path)).toEqual([
+      "active-large",
+      "active-small",
+      "cold",
+    ]);
+    expect(selection.coldBytes).toBe(50_140_000);
+    expect(selection.deferredFiles).toBe(0);
+  });
 });
 
-function claudeLine(id: number, outputTokens: number): string {
-  return `${JSON.stringify({
-    type: "assistant",
-    timestamp: "2026-08-01T10:00:00Z",
-    requestId: `req_${id}`,
-    sessionId: "session-1",
-    message: {
-      id: `msg_${id}`,
-      model: "claude-fable-5",
-      usage: { input_tokens: 10, output_tokens: outputTokens },
-    },
-  })}\n`;
-}
-
-function codexMetaLine(): string {
-  return `${JSON.stringify({
-    type: "session_meta",
-    timestamp: "2026-08-01T10:00:00Z",
-    payload: { type: "session_meta", id: "codex-session-1" },
-  })}\n`;
-}
-
-function codexModelLine(model: string): string {
-  return `${JSON.stringify({
-    type: "turn_context",
-    timestamp: "2026-08-01T10:00:01Z",
-    payload: { type: "turn_context", model },
-  })}\n`;
-}
-
-function codexUsageLine(outputTokens: number, secondsOffset: number): string {
-  return `${JSON.stringify({
-    type: "event_msg",
-    timestamp: `2026-08-01T10:00:${String(secondsOffset).padStart(2, "0")}Z`,
-    payload: {
-      type: "token_count",
-      info: { last_token_usage: { input_tokens: 100, output_tokens: outputTokens } },
-    },
-  })}\n`;
-}
-
-describe("readTranscriptRecords resume", () => {
-  it("parses only appended lines when resuming a grown file", async () => {
-    const path = NodePath.join(dir, "claude.jsonl");
-    await NodeFSP.writeFile(path, claudeLine(1, 5) + claudeLine(2, 7));
-    const first = await readTranscriptRecords(path, "claude");
-    assert.isNotNull(first);
-    assert.strictEqual(first.records.length, 2);
-    assert.isFalse(first.resumed);
-
-    await NodeFSP.appendFile(path, claudeLine(3, 11));
-    const second = await readTranscriptRecords(path, "claude", first.position);
-    assert.isNotNull(second);
-    assert.isTrue(second.resumed);
-    assert.strictEqual(second.records.length, 1);
-    assert.strictEqual(second.records[0]?.totals.outputTokens, 11);
-
-    // The stitched result matches a from-scratch parse of the whole file.
-    const full = await readTranscriptRecords(path, "claude");
-    assert.isNotNull(full);
-    assert.deepStrictEqual([...first.records, ...second.records], [...full.records]);
+describe("incremental transcript reads", () => {
+  it("lists nested recent transcripts with bounded metadata batches and excludes other files", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-usage-list-"));
+    const nested = NodePath.join(directory, "nested");
+    try {
+      await NodeFSP.mkdir(nested);
+      await Promise.all(
+        Array.from({ length: 70 }, (_, index) =>
+          NodeFSP.writeFile(NodePath.join(nested, `${index}.jsonl`), "{}\n"),
+        ),
+      );
+      await NodeFSP.writeFile(NodePath.join(directory, "ignore.txt"), "text");
+      const old = NodePath.join(directory, "old.jsonl");
+      await NodeFSP.writeFile(old, "{}\n");
+      await NodeFSP.utimes(old, 1, 1);
+      const files = await listTranscriptFiles(directory, 2_000, "codex");
+      expect(files).toHaveLength(70);
+      expect(files.every((file) => file.path.startsWith(nested) && file.size === 3)).toBe(true);
+      expect(await listTranscriptFiles(NodePath.join(directory, "missing"), 0, "codex")).toEqual(
+        [],
+      );
+    } finally {
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
   });
+  it("resumes a growing Codex JSONL file without rereading its prefix", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-usage-append-"));
+    const path = NodePath.join(directory, "rollout.jsonl");
+    const first =
+      [
+        JSON.stringify({
+          timestamp: "2026-08-29T10:00:00.000Z",
+          type: "session_meta",
+          payload: { id: "session-a" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-08-29T10:00:01.000Z",
+          type: "turn_context",
+          payload: { model: "gpt-5.6-sol" },
+        }),
+        JSON.stringify({
+          timestamp: "2026-08-29T10:00:02.000Z",
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: {
+              last_token_usage: { input_tokens: 10, cached_input_tokens: 3, output_tokens: 2 },
+            },
+          },
+        }),
+      ].join("\n") + "\n";
+    const second =
+      JSON.stringify({
+        timestamp: "2026-08-29T10:00:03.000Z",
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            last_token_usage: { input_tokens: 20, cached_input_tokens: 5, output_tokens: 4 },
+          },
+        },
+      }) + "\n";
 
-  it("carries the Codex reducer state across the resume boundary", async () => {
-    const path = NodePath.join(dir, "rollout.jsonl");
-    await NodeFSP.writeFile(path, codexMetaLine() + codexModelLine("gpt-5.2-codex"));
-    const first = await readTranscriptRecords(path, "codex");
-    assert.isNotNull(first);
-    assert.strictEqual(first.records.length, 0);
+    try {
+      await NodeFSP.writeFile(path, first);
+      const initial = await readTranscriptRecords(path, "codex", { endByte: first.length - 1 });
+      expect(initial?.records).toHaveLength(1);
+      expect(await transcriptCursorIsLineBoundary(path, first.length)).toBe(true);
+      const codexState = initial?.codexState;
+      if (codexState === undefined) throw new Error("Codex parser state was not returned");
 
-    // The appended usage event has no turn_context or session_meta of its own;
-    // model and session must come from the state captured before the boundary.
-    await NodeFSP.appendFile(path, codexUsageLine(9, 5));
-    const second = await readTranscriptRecords(path, "codex", first.position);
-    assert.isNotNull(second);
-    assert.isTrue(second.resumed);
-    assert.strictEqual(second.records.length, 1);
-    assert.strictEqual(second.records[0]?.model, "gpt-5.2-codex");
-    assert.strictEqual(second.records[0]?.sessionId, "codex-session-1");
-  });
+      await NodeFSP.appendFile(path, second);
+      const appended = await readTranscriptRecords(path, "codex", {
+        startByte: first.length,
+        endByte: first.length + second.length - 1,
+        codexState,
+      });
 
-  it("suppresses a Codex duplicate usage event that straddles the boundary", async () => {
-    const path = NodePath.join(dir, "rollout.jsonl");
-    await NodeFSP.writeFile(
-      path,
-      codexMetaLine() + codexModelLine("gpt-5.2-codex") + codexUsageLine(9, 5),
-    );
-    const first = await readTranscriptRecords(path, "codex");
-    assert.isNotNull(first);
-    assert.strictEqual(first.records.length, 1);
-
-    // Codex re-emits an unchanged token_count on stream boundaries; the copy
-    // lands after the resume point and must still be dropped.
-    await NodeFSP.appendFile(path, codexUsageLine(9, 5) + codexUsageLine(21, 8));
-    const second = await readTranscriptRecords(path, "codex", first.position);
-    assert.isNotNull(second);
-    assert.isTrue(second.resumed);
-    assert.deepStrictEqual(
-      second.records.map((record) => record.totals.outputTokens),
-      [21],
-    );
-  });
-
-  it("defers an unterminated trailing line to tailRecords, then consumes it once terminated", async () => {
-    const path = NodePath.join(dir, "claude.jsonl");
-    const unterminated = claudeLine(2, 7).trimEnd();
-    await NodeFSP.writeFile(path, claudeLine(1, 5) + unterminated);
-    const first = await readTranscriptRecords(path, "claude");
-    assert.isNotNull(first);
-    assert.strictEqual(first.records.length, 1);
-    assert.strictEqual(first.tailRecords.length, 1);
-    assert.strictEqual(first.tailRecords[0]?.totals.outputTokens, 7);
-
-    // Completing the line and appending another re-reads from the resume
-    // point, so the once-tail record arrives exactly once as a line record.
-    await NodeFSP.appendFile(path, `\n${claudeLine(3, 11)}`);
-    const second = await readTranscriptRecords(path, "claude", first.position);
-    assert.isNotNull(second);
-    assert.isTrue(second.resumed);
-    assert.deepStrictEqual(
-      second.records.map((record) => record.totals.outputTokens),
-      [7, 11],
-    );
-    assert.strictEqual(second.tailRecords.length, 0);
-  });
-
-  it("re-parses from the start when the guard bytes no longer match", async () => {
-    const path = NodePath.join(dir, "claude.jsonl");
-    await NodeFSP.writeFile(path, claudeLine(1, 5));
-    const first = await readTranscriptRecords(path, "claude");
-    assert.isNotNull(first);
-
-    // Same path, larger size, different content: a replaced file, not growth.
-    await NodeFSP.writeFile(path, claudeLine(4, 13) + claudeLine(5, 17));
-    const second = await readTranscriptRecords(path, "claude", first.position);
-    assert.isNotNull(second);
-    assert.isFalse(second.resumed);
-    assert.deepStrictEqual(
-      second.records.map((record) => record.totals.outputTokens),
-      [13, 17],
-    );
-  });
-
-  it("re-parses from the start when the file shrank below the resume point", async () => {
-    const path = NodePath.join(dir, "claude.jsonl");
-    await NodeFSP.writeFile(path, claudeLine(1, 5) + claudeLine(2, 7));
-    const first = await readTranscriptRecords(path, "claude");
-    assert.isNotNull(first);
-
-    await NodeFSP.writeFile(path, claudeLine(3, 11));
-    const second = await readTranscriptRecords(path, "claude", first.position);
-    assert.isNotNull(second);
-    assert.isFalse(second.resumed);
-    assert.deepStrictEqual(
-      second.records.map((record) => record.totals.outputTokens),
-      [11],
-    );
-  });
-
-  it("parses a line larger than one stream chunk", async () => {
-    // Tool-heavy transcripts carry multi-megabyte single lines; they arrive
-    // split across many chunks and must reassemble into one record.
-    const path = NodePath.join(dir, "claude.jsonl");
-    const bigLine = `${JSON.stringify({
-      type: "assistant",
-      timestamp: "2026-08-01T10:00:00Z",
-      requestId: "req_big",
-      sessionId: "session-1",
-      padding: "x".repeat(512 * 1024),
-      message: {
-        id: "msg_big",
-        model: "claude-fable-5",
-        usage: { input_tokens: 10, output_tokens: 42 },
-      },
-    })}\n`;
-    await NodeFSP.writeFile(path, bigLine + claudeLine(2, 7));
-
-    const parsed = await readTranscriptRecords(path, "claude");
-    assert.isNotNull(parsed);
-    assert.deepStrictEqual(
-      parsed.records.map((record) => record.totals.outputTokens),
-      [42, 7],
-    );
-  });
-
-  it("returns null for an unreadable file", async () => {
-    assert.isNull(await readTranscriptRecords(NodePath.join(dir, "missing.jsonl"), "claude"));
+      expect(appended?.records).toHaveLength(1);
+      expect(appended?.records[0]?.model).toBe("gpt-5.6-sol");
+      expect(appended?.records[0]?.sessionId).toBe("session-a");
+      expect(appended?.records[0]?.totals.outputTokens).toBe(4);
+    } finally {
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
   });
 });

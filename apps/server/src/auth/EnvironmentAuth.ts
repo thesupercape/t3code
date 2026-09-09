@@ -36,7 +36,10 @@ import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
-import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
+import {
+  layerConfig as SqlitePersistenceLayer,
+  existingLayerConfig as ExistingSqlitePersistenceLayer,
+} from "../persistence/Layers/Sqlite.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -1038,5 +1041,11 @@ const storageLayer = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistenceLa
 
 export const runtimeLayer = layer.pipe(
   Layer.provideMerge(storageLayer),
+  Layer.provideMerge(ServerEnvironment.identityLayer),
+);
+
+/** Authenticate CLI requests without upgrading the running server's database. */
+export const existingRuntimeLayer = layer.pipe(
+  Layer.provideMerge(Layer.mergeAll(ServerSecretStore.layer, ExistingSqlitePersistenceLayer)),
   Layer.provideMerge(ServerEnvironment.identityLayer),
 );

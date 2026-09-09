@@ -1,6 +1,101 @@
 // @effect-diagnostics globalDate:off -- UI snooze presets use local calendar boundaries and Intl labels.
 import type { OrchestrationThreadShell } from "@t3tools/contracts";
 
+// @effect-diagnostics globalDate:off -- UI snooze presets use local calendar boundaries and Intl labels.
+export type ChangeRequestStateLike = "open" | "closed" | "merged";
+
+/**
+ * The slice of a change request the settle rules need. `updatedAt` is the
+ * provider's last-activity timestamp; for a merged/closed request it bounds
+ * when the terminal state landed.
+ */
+export interface ChangeRequestSettleSource {
+  readonly state: ChangeRequestStateLike;
+  readonly updatedAt?: string | null | undefined;
+}
+
+/** What the settle rules need to know about the thread's own timeline. */
+export type ThreadActivitySource = Pick<
+  OrchestrationThreadShell,
+  "createdAt" | "latestUserMessageAt" | "latestTurn"
+>;
+
+/**
+ * Latest USER-initiated activity: messages and the turn requests they start,
+ * deliberately not the agent-side started/completed stamps. The settle-on-
+ * merge anchor uses this so a merge landing mid-turn still settles the
+ * thread when that turn finishes, while a user re-engaging after the merge
+ * blocks it for good. Falls back to creation time for untouched threads.
+ */
+function threadUserActivityAnchorAt(thread: ThreadActivitySource): string {
+  const messageAt = thread.latestUserMessageAt;
+  const requestedAt = thread.latestTurn?.requestedAt;
+  let anchor = thread.createdAt;
+  for (const candidate of [messageAt, requestedAt]) {
+    if (candidate != null && Date.parse(candidate) > Date.parse(anchor)) {
+      anchor = candidate;
+    }
+  }
+  return anchor;
+}
+
+/**
+ * Returns whether the change request settles the thread immediately. A
+ * terminal request settles the thread only while it postdates every user-
+ * initiated event in it: settling on a merge happens ONCE. A request last
+ * touched before the thread was created is inherited branch history (a new
+ * thread started at a worktree root whose PR already merged), and one older
+ * than the user's latest engagement was already adjudicated — re-engaging a
+ * thread whose PR merged is the user saying the conversation outlived the
+ * PR. Unknown timestamps keep the old always-settle behavior.
+ */
+export function changeRequestAutoSettles(
+  changeRequest: ChangeRequestSettleSource | null | undefined,
+  options: {
+    readonly autoSettleOnMerge?: boolean | undefined;
+    readonly thread?: ThreadActivitySource | null | undefined;
+  } = {},
+): boolean {
+  if (changeRequest == null) return false;
+  const terminal =
+    changeRequest.state === "closed" ||
+    (changeRequest.state === "merged" && options.autoSettleOnMerge !== false);
+  if (!terminal) return false;
+  if (changeRequest.updatedAt == null || options.thread == null) return true;
+  const updatedAtMs = Date.parse(changeRequest.updatedAt);
+  const anchorAtMs = Date.parse(threadUserActivityAnchorAt(options.thread));
+  // Malformed timestamps fall back to settling, matching servers that never
+  // report updatedAt.
+  if (Number.isNaN(updatedAtMs) || Number.isNaN(anchorAtMs)) return true;
+  return updatedAtMs >= anchorAtMs;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+export function threadLastActivityAt(
+  shell: Pick<OrchestrationThreadShell, "latestUserMessageAt" | "latestTurn">,
+): string | null {
+  const candidates = [
+    shell.latestUserMessageAt,
+    shell.latestTurn?.requestedAt,
+    shell.latestTurn?.startedAt,
+    shell.latestTurn?.completedAt,
+  ];
+  let latest: string | null = null;
+  let latestTimestamp = Number.NEGATIVE_INFINITY;
+
+  for (const candidate of candidates) {
+    if (candidate === null || candidate === undefined) continue;
+    const timestamp = Date.parse(candidate);
+    if (timestamp > latestTimestamp) {
+      latest = candidate;
+      latestTimestamp = timestamp;
+    }
+  }
+
+  return latest;
+}
+
 /**
  * A queued turn start lives for at most this long: session adoption takes
  * seconds, so a user message still unadopted after the grace window is a
@@ -9,8 +104,6 @@ import type { OrchestrationThreadShell } from "@t3tools/contracts";
  * such threads would be permanently unsettleable.
  */
 export const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
-const DAY_MS = 24 * 60 * 60 * 1_000;
-
 /**
  * A user message no turn has picked up yet: the turn.start command was
  * dispatched (message-sent + turn-start-requested) but no session has
@@ -165,6 +258,42 @@ export function threadWokeAt(
   }
   // No raised hand: woke iff the timer elapsed (still-snoozed → null).
   return wakeAtMs <= Date.parse(options.now) ? shell.snoozedUntil : null;
+}
+
+export function effectiveSettled(
+  shell: OrchestrationThreadShell,
+  options: {
+    readonly now: string;
+    readonly autoSettleAfterDays: number | null;
+    readonly autoSettleOnMerge?: boolean;
+    readonly changeRequest?: ChangeRequestSettleSource | null;
+  },
+): boolean {
+  if (shell.hasPendingApprovals || shell.hasPendingUserInput) return false;
+  if (shell.session?.status === "starting" || shell.session?.status === "running") return false;
+  if (hasQueuedTurnStart(shell, { now: options.now })) {
+    const serverAdjudicated =
+      shell.settledOverride === "settled" &&
+      shell.settledAt !== null &&
+      shell.latestUserMessageAt !== null &&
+      Date.parse(shell.settledAt) >= Date.parse(shell.latestUserMessageAt);
+    if (!serverAdjudicated) return false;
+  }
+  if (shell.settledOverride === "settled") return true;
+  if (shell.settledOverride === "active") return false;
+  if (
+    changeRequestAutoSettles(options.changeRequest, {
+      autoSettleOnMerge: options.autoSettleOnMerge,
+      thread: shell,
+    })
+  )
+    return true;
+  if (options.changeRequest?.state === "open" || options.autoSettleAfterDays === null) return false;
+  const lastActivityAt = threadLastActivityAt(shell);
+  return (
+    lastActivityAt !== null &&
+    Date.parse(lastActivityAt) < Date.parse(options.now) - options.autoSettleAfterDays * DAY_MS
+  );
 }
 
 const HOUR_MS = 60 * 60 * 1_000;

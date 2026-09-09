@@ -307,13 +307,11 @@ export function shouldShowThreadJumpHintsForModifiers(
   keybindings: ResolvedKeybindingsConfig,
   options?: ShortcutMatchOptions,
 ): boolean {
-  // The embedded terminal owns keystrokes while it has focus: the Ghostty
-  // surface encodes the keydown and can write the pressed key into the shell
-  // before our window-level shortcut handling ever runs, regardless of any
-  // configured `when` clause on the jump command. Advertising jump hints
-  // here would promise a shortcut that instead types into the terminal, so
-  // never show them while the terminal is focused.
-  if (resolveContext(options).terminalFocus) {
+  // The embedded terminal owns keystrokes while it has focus. Other active
+  // surfaces are resolved below through their contextual bindings and normal
+  // conflict priority, exactly like resolveShortcutCommand.
+  const context = resolveContext(options);
+  if (context.terminalFocus) {
     return false;
   }
 
@@ -328,6 +326,15 @@ export function shouldShowThreadJumpHintsForModifiers(
   }
 
   return false;
+}
+
+/** Compatibility entry point for callers that already have a keyboard event. */
+export function shouldShowThreadJumpHints(
+  event: ShortcutEventLike,
+  keybindings: ResolvedKeybindingsConfig,
+  options?: ShortcutMatchOptions,
+): boolean {
+  return shouldShowThreadJumpHintsForModifiers(event, keybindings, options);
 }
 
 export function modelPickerJumpCommandForIndex(

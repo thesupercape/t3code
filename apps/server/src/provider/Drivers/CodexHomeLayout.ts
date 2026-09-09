@@ -10,7 +10,7 @@ import * as PlatformError from "effect/PlatformError";
 import { expandHomePath } from "../../pathExpansion.ts";
 
 export interface CodexHomeLayout {
-  readonly mode: "direct" | "authOverlay";
+  readonly mode: "direct" | "authOverlay" | "isolated";
   readonly sharedHomePath: string;
   readonly effectiveHomePath: string | undefined;
   readonly continuationKey: string;
@@ -32,6 +32,9 @@ const KNOWN_SHARED_DIRECTORIES = [
 const PRIVATE_ENTRY_NAMES = new Set(["auth.json", "models_cache.json"]);
 const SHADOW_LOCAL_ENTRY_NAMES = new Set(["log", "memories", "tmp"]);
 const REPLACEABLE_SHARED_RUNTIME_DIRECTORIES = new Set(["mcp-oauth-locks"]);
+/** Assets that a T3-owned runtime may read from the configured Codex home. */
+const ISOLATED_SHARED_ENTRY_NAMES = new Set(["auth.json", "config.toml", "plugins", "skills"]);
+const ISOLATED_COPIED_ENTRY_NAMES = new Set(["auth.json", "config.toml"]);
 
 function resolveHomePath(path: Path.Path, value: string | undefined): string {
   const expanded =
@@ -41,13 +44,32 @@ function resolveHomePath(path: Path.Path, value: string | undefined): string {
   return path.resolve(expanded);
 }
 
+/** Stable private-home location for ordinary T3 Codex instances. */
+export function codexIsolatedHomePath(
+  path: Path.Path,
+  baseDir: string,
+  instanceId: string,
+): string {
+  return path.resolve(path.join(baseDir, "codex-home", instanceId));
+}
+
 export const resolveCodexHomeLayout = Effect.fn("resolveCodexHomeLayout")(function* (
   config: CodexSettings,
+  options?: { readonly isolatedHomePath?: string },
 ): Effect.fn.Return<CodexHomeLayout, never, Path.Path> {
   const path = yield* Path.Path;
   const sharedHomePath = resolveHomePath(path, config.homePath);
   const shadowHomePath = config.shadowHomePath.trim();
   if (shadowHomePath.length === 0) {
+    const isolatedHomePath = options?.isolatedHomePath?.trim();
+    if (isolatedHomePath) {
+      return {
+        mode: "isolated",
+        sharedHomePath,
+        effectiveHomePath: path.resolve(expandHomePath(isolatedHomePath)),
+        continuationKey: `codex:home:${sharedHomePath}`,
+      };
+    }
     return {
       mode: "direct",
       sharedHomePath,
@@ -74,7 +96,14 @@ export class CodexShadowHomeFileSystemError extends Schema.TaggedError<CodexShad
   "CodexShadowHomeFileSystemError",
   {
     ...CodexShadowHomeContext,
-    operation: Schema.Literals(["readLink", "makeDirectory", "readDirectory", "remove", "symlink"]),
+    operation: Schema.Literals([
+      "readLink",
+      "makeDirectory",
+      "readDirectory",
+      "remove",
+      "symlink",
+      "copy",
+    ]),
     path: Schema.String,
     targetPath: Schema.optional(Schema.String),
     entryName: Schema.optional(Schema.String),
@@ -130,6 +159,23 @@ export const CodexShadowHomeError = Schema.Union([
   CodexShadowHomePrivateEntrySymlinkError,
 ]);
 export type CodexShadowHomeError = typeof CodexShadowHomeError.Type;
+
+export class CodexResumeRolloutMigrationError extends Schema.TaggedError<CodexResumeRolloutMigrationError>()(
+  "CodexResumeRolloutMigrationError",
+  {
+    sharedHomePath: Schema.String,
+    effectiveHomePath: Schema.String,
+    threadId: Schema.String,
+    operation: Schema.Literals(["readDirectory", "makeDirectory", "copy"]),
+    path: Schema.String,
+    code: Schema.optionalKey(Schema.String),
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Could not migrate Codex rollout for thread '${this.threadId}' during '${this.operation}' at '${this.path}'.`;
+  }
+}
 
 type LinkState =
   | {
@@ -292,6 +338,65 @@ const ensureSymlink = Effect.fn("CodexHomeLayout.ensureSymlink")(function* (inpu
   }
 });
 
+const ensureIsolatedCopiedEntry = Effect.fn("CodexHomeLayout.ensureIsolatedCopiedEntry")(
+  function* (input: {
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly sharedHomePath: string;
+    readonly effectiveHomePath: string;
+    readonly entryName: string;
+  }): Effect.fn.Return<void, CodexShadowHomeError, Path.Path> {
+    const path = yield* Path.Path;
+    const source = path.join(input.sharedHomePath, input.entryName);
+    const destination = path.join(input.effectiveHomePath, input.entryName);
+    const state = yield* readLinkState({
+      ...input,
+      linkPath: destination,
+    });
+    if (state._tag === "Symlink") {
+      return yield* new CodexShadowHomeEntryConflictError({
+        sharedHomePath: input.sharedHomePath,
+        effectiveHomePath: input.effectiveHomePath,
+        entryName: input.entryName,
+        linkPath: destination,
+        targetPath: source,
+      });
+    }
+    // Keep a private auth/config file once created so atomic refreshes made by
+    // Codex cannot replace a link or write into the desktop home.
+    if (state._tag === "NotSymlink") return;
+    const contents = yield* input.fileSystem.readFile(source).pipe(
+      Effect.mapError(
+        (cause) =>
+          new CodexShadowHomeFileSystemError({
+            sharedHomePath: input.sharedHomePath,
+            effectiveHomePath: input.effectiveHomePath,
+            operation: "copy",
+            path: source,
+            entryName: input.entryName,
+            cause,
+          }),
+      ),
+    );
+    yield* input.fileSystem.writeFile(destination, contents, { flag: "wx" }).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          cause.reason._tag === "AlreadyExists"
+            ? Effect.void
+            : Effect.fail(
+                new CodexShadowHomeFileSystemError({
+                  sharedHomePath: input.sharedHomePath,
+                  effectiveHomePath: input.effectiveHomePath,
+                  operation: "copy",
+                  path: destination,
+                  entryName: input.entryName,
+                  cause,
+                }),
+              ),
+      }),
+    );
+  },
+);
+
 const ensureShadowAuthIsPrivate = Effect.fn("CodexHomeLayout.ensureShadowAuthIsPrivate")(
   function* (input: {
     readonly fileSystem: FileSystem.FileSystem;
@@ -320,7 +425,7 @@ const ensureShadowAuthIsPrivate = Effect.fn("CodexHomeLayout.ensureShadowAuthIsP
 export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome")(function* (
   layout: CodexHomeLayout,
 ) {
-  if (layout.mode !== "authOverlay") return;
+  if (layout.mode === "direct") return;
   const effectiveHomePath = layout.effectiveHomePath;
   if (!effectiveHomePath) return;
   if (layout.sharedHomePath === effectiveHomePath) {
@@ -347,16 +452,20 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
       }),
     );
 
-  yield* Effect.all(
-    [
-      makeDirectory(layout.sharedHomePath),
-      makeDirectory(effectiveHomePath),
-      ...KNOWN_SHARED_DIRECTORIES.map((directory) =>
+  yield* makeDirectory(layout.sharedHomePath);
+  yield* makeDirectory(effectiveHomePath);
+
+  // An isolated T3 home intentionally has no links to Codex's transcript,
+  // SQLite, cache, log, worktree, or temporary state. Those directories are
+  // created by the T3-owned app-server as needed.
+  if (layout.mode === "authOverlay") {
+    yield* Effect.all(
+      KNOWN_SHARED_DIRECTORIES.map((directory) =>
         makeDirectory(path.join(layout.sharedHomePath, directory)),
       ),
-    ],
-    { concurrency: "unbounded" },
-  );
+      { concurrency: "unbounded" },
+    );
+  }
 
   const sharedEntryNames = yield* fileSystem.readDirectory(layout.sharedHomePath).pipe(
     Effect.catchTags({
@@ -370,30 +479,47 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
         }),
     }),
   );
-  const entries = new Set<string>(KNOWN_SHARED_DIRECTORIES);
-  for (const entryName of sharedEntryNames) {
-    if (!PRIVATE_ENTRY_NAMES.has(entryName) && !SHADOW_LOCAL_ENTRY_NAMES.has(entryName)) {
-      entries.add(entryName);
+  const entries =
+    layout.mode === "isolated"
+      ? new Set<string>(
+          sharedEntryNames.filter((entryName) => ISOLATED_SHARED_ENTRY_NAMES.has(entryName)),
+        )
+      : new Set<string>(KNOWN_SHARED_DIRECTORIES);
+  if (layout.mode === "authOverlay") {
+    for (const entryName of sharedEntryNames) {
+      if (!PRIVATE_ENTRY_NAMES.has(entryName) && !SHADOW_LOCAL_ENTRY_NAMES.has(entryName)) {
+        entries.add(entryName);
+      }
     }
   }
 
-  yield* Effect.forEach(
-    PRIVATE_ENTRY_NAMES,
-    (entryName) =>
-      entryName === "auth.json"
-        ? Effect.void
-        : removePrivateSymlink({
-            fileSystem,
-            sharedHomePath: layout.sharedHomePath,
-            effectiveHomePath,
-            entryName,
-          }),
-    { discard: true },
-  );
+  if (layout.mode === "authOverlay") {
+    yield* Effect.forEach(
+      PRIVATE_ENTRY_NAMES,
+      (entryName) =>
+        entryName === "auth.json"
+          ? Effect.void
+          : removePrivateSymlink({
+              fileSystem,
+              sharedHomePath: layout.sharedHomePath,
+              effectiveHomePath,
+              entryName,
+            }),
+      { discard: true },
+    );
+  }
 
   yield* Effect.forEach(
     entries,
     (entryName) => {
+      if (layout.mode === "isolated" && ISOLATED_COPIED_ENTRY_NAMES.has(entryName)) {
+        return ensureIsolatedCopiedEntry({
+          fileSystem,
+          sharedHomePath: layout.sharedHomePath,
+          effectiveHomePath,
+          entryName,
+        });
+      }
       if (PRIVATE_ENTRY_NAMES.has(entryName)) {
         return Effect.void;
       }
@@ -407,10 +533,159 @@ export const materializeCodexShadowHome = Effect.fn("materializeCodexShadowHome"
     { discard: true },
   );
 
-  yield* ensureShadowAuthIsPrivate({
-    fileSystem,
-    sharedHomePath: layout.sharedHomePath,
+  if (layout.mode === "authOverlay") {
+    yield* ensureShadowAuthIsPrivate({
+      fileSystem,
+      sharedHomePath: layout.sharedHomePath,
+      effectiveHomePath,
+    });
+  }
+});
+
+/**
+ * Copies one persisted Codex rollout into an isolated home on first resume.
+ * The source is never removed or modified, and only the exact provider thread
+ * named by the persisted resume cursor is copied.
+ */
+export const migrateCodexResumeRollout = Effect.fn("migrateCodexResumeRollout")(function* (input: {
+  readonly sharedHomePath: string;
+  readonly effectiveHomePath: string;
+  readonly resumeThreadId: string | undefined;
+}): Effect.fn.Return<void, CodexResumeRolloutMigrationError, FileSystem.FileSystem | Path.Path> {
+  if (!input.resumeThreadId || input.sharedHomePath === input.effectiveHomePath) return;
+  // Codex rollout filenames encode UUID thread ids. Refuse to turn a
+  // persisted value into a path component when it is outside that contract.
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.resumeThreadId)
+  ) {
+    return;
+  }
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const sharedHomePath = path.resolve(input.sharedHomePath);
+  const effectiveHomePath = path.resolve(input.effectiveHomePath);
+  const roots = ["sessions", "archived_sessions"];
+  const suffix = `-${input.resumeThreadId}.jsonl`;
+
+  const migrationError = (
+    operation: CodexResumeRolloutMigrationError["operation"],
+    pathValue: string,
+    cause: unknown,
+  ) =>
+    new CodexResumeRolloutMigrationError({
+      sharedHomePath,
+      effectiveHomePath,
+      threadId: input.resumeThreadId!,
+      operation,
+      path: pathValue,
+      ...(typeof cause === "object" &&
+      cause !== null &&
+      "code" in cause &&
+      typeof cause.code === "string"
+        ? { code: cause.code }
+        : {}),
+      cause,
+    });
+  const findRollout = Effect.fn("CodexHomeLayout.findRollout")(function* (
+    root: string,
+  ): Effect.fn.Return<string | undefined, CodexResumeRolloutMigrationError> {
+    const entries = yield* fileSystem.readDirectory(root).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          cause.reason._tag === "NotFound"
+            ? Effect.succeed<ReadonlyArray<string>>([])
+            : Effect.fail(migrationError("readDirectory", root, cause)),
+      }),
+    );
+    for (const entryName of entries) {
+      const candidate = path.join(root, entryName);
+      const symlink = yield* fileSystem.readLink(candidate).pipe(
+        Effect.map(() => true),
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            isNotSymlinkError(cause)
+              ? Effect.succeed(false)
+              : cause.reason._tag === "NotFound"
+                ? Effect.succeed(false)
+                : Effect.fail(migrationError("readDirectory", candidate, cause)),
+        }),
+      );
+      if (symlink) continue;
+      const isDirectory = yield* fileSystem.stat(candidate).pipe(
+        Effect.map((info) => info.type === "Directory"),
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            cause.reason._tag === "NotFound"
+              ? Effect.succeed(false)
+              : Effect.fail(migrationError("readDirectory", candidate, cause)),
+        }),
+      );
+      if (isDirectory) {
+        const found = yield* findRollout(candidate);
+        if (found) return found;
+      } else if (entryName.endsWith(suffix)) {
+        return candidate;
+      }
+    }
+    return undefined;
+  });
+
+  // Most resumes are already migrated; keep that path independent of the
+  // potentially large legacy home scan.
+  for (const rootName of roots) {
+    if (yield* findRollout(path.join(effectiveHomePath, rootName))) return;
+  }
+  for (const rootName of roots) {
+    const sourceRoot = path.join(sharedHomePath, rootName);
+    const source = yield* findRollout(sourceRoot);
+    if (!source) continue;
+    const relative = path.relative(sourceRoot, source);
+    const destination = path.join(effectiveHomePath, rootName, relative);
+    const destinationExists = yield* fileSystem
+      .exists(destination)
+      .pipe(Effect.catchTags({ PlatformError: () => Effect.succeed(false) }));
+    if (destinationExists) return;
+    yield* fileSystem
+      .makeDirectory(path.dirname(destination), { recursive: true })
+      .pipe(
+        Effect.mapError((cause) =>
+          migrationError("makeDirectory", path.dirname(destination), cause),
+        ),
+      );
+    const contents = yield* fileSystem
+      .readFile(source)
+      .pipe(Effect.mapError((cause) => migrationError("copy", source, cause)));
+    const temporary = yield* fileSystem
+      .makeTempFile({
+        directory: path.dirname(destination),
+        prefix: ".t3-codex-resume-",
+      })
+      .pipe(Effect.mapError((cause) => migrationError("copy", destination, cause)));
+    yield* Effect.ensuring(
+      fileSystem.writeFile(temporary, contents).pipe(
+        Effect.mapError((cause) => migrationError("copy", temporary, cause)),
+        Effect.andThen(
+          fileSystem.link(temporary, destination).pipe(
+            Effect.catchTags({
+              PlatformError: (cause) =>
+                cause.reason._tag === "AlreadyExists"
+                  ? Effect.void
+                  : Effect.fail(migrationError("copy", destination, cause)),
+            }),
+          ),
+        ),
+      ),
+      fileSystem.remove(temporary).pipe(Effect.catchTags({ PlatformError: () => Effect.void })),
+    );
+    return;
+  }
+  return yield* new CodexResumeRolloutMigrationError({
+    sharedHomePath,
     effectiveHomePath,
+    threadId: input.resumeThreadId,
+    operation: "readDirectory",
+    path: sharedHomePath,
+    cause: new Error("The persisted Codex resume rollout was not found."),
   });
 });
 

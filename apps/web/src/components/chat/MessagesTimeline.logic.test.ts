@@ -629,7 +629,6 @@ describe("streaming row projection", () => {
     check({ supportsConversationRollback: true });
   });
 });
-
 describe("expanded tool group scrolling", () => {
   const entries = [{ id: "first" }, { id: "second" }];
 

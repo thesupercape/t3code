@@ -264,6 +264,7 @@ const getGeneratedPaths = Effect.fn("getGeneratedPaths")(function* () {
 
 const ensureGeneratedDir = Effect.fn("ensureGeneratedDir")(function* () {
   const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const { generatedDir } = yield* getGeneratedPaths();
   yield* fs.makeDirectory(generatedDir, { recursive: true });
 });
@@ -404,11 +405,12 @@ function addAsyncQuestionFields(value: Schema.Json): Schema.Json {
   if (
     properties &&
     typeof properties === "object" &&
-    itemType &&
-    typeof itemType === "object" &&
-    "enum" in itemType &&
-    Array.isArray(itemType.enum) &&
-    itemType.enum.includes("agentMessage")
+    ((itemType &&
+      typeof itemType === "object" &&
+      "enum" in itemType &&
+      Array.isArray(itemType.enum) &&
+      itemType.enum.includes("agentMessage")) ||
+      ("id" in properties && "text" in properties && "phase" in properties))
   ) {
     return {
       ...value,
@@ -685,6 +687,22 @@ function rewriteExternalRefs(
   ) as Schema.Json;
 }
 
+function schemaOutputForAsyncAgentMessages(output: string): string {
+  return output
+    .replaceAll(
+      '  | "serverOverloaded"\n',
+      '  | "serverOverloaded"\n  | "misalignmentPolicyViolation"\n',
+    )
+    .replaceAll(
+      '      "serverOverloaded",\n',
+      '      "serverOverloaded",\n      "misalignmentPolicyViolation",\n',
+    )
+    .replace(
+      /Schema\.Struct\(\{ "id": Schema\.String, "memoryCitation"/g,
+      'Schema.Struct({ "delivery": Schema.optionalKey(Schema.Union([Schema.Literal("async"), Schema.Null])), "questions": Schema.optionalKey(Schema.Union([Schema.Array(Schema.Struct({ "title": Schema.String, "options": Schema.optionalKey(Schema.Union([Schema.Array(Schema.String), Schema.Null])) })), Schema.Null])), "id": Schema.String, "memoryCitation"',
+    );
+}
+
 const generateFiles = Effect.fn("generateFiles")(function* () {
   yield* ensureGeneratedDir();
 
@@ -756,6 +774,28 @@ const generateFiles = Effect.fn("generateFiles")(function* () {
     }
   }
 
+  // Codex 0.148+ includes this capability marker in the model catalog before
+  // the upstream protocol schema publishes it. Keep the decoded response
+  // typed and preserve the value for the provider capability mapper.
+  const modelListModel = aggregateSchemas["V2ModelListResponse__Model"];
+  if (modelListModel && typeof modelListModel === "object" && !Array.isArray(modelListModel)) {
+    const modelSchema = modelListModel as {
+      properties?: Record<string, Schema.Json>;
+    };
+    modelSchema.properties = {
+      ...modelSchema.properties,
+      multiAgentVersion: {
+        anyOf: [
+          { $ref: "#/components/schemas/V2ModelListResponse__ModelMultiAgentVersion" },
+          { type: "null" },
+        ],
+      },
+    };
+    aggregateSchemas["V2ModelListResponse__ModelMultiAgentVersion"] = {
+      type: "string",
+    };
+  }
+
   const generator = makeJsonSchemaGenerator();
   for (const [name, schema] of Object.entries(aggregateSchemas).toSorted(([left], [right]) =>
     left.localeCompare(right),
@@ -798,13 +838,20 @@ const generateFiles = Effect.fn("generateFiles")(function* () {
     "",
   ];
 
-  const schemaOutput = [
-    ...prelude,
-    'import * as Schema from "effect/Schema";',
-    "",
-    [...generatedEntries.values()].join("\n\n"),
-    "",
-  ].join("\n");
+  // Agent-message fields are nested behind ThreadItem references in some
+  // upstream namespaces, so apply the additive fields after flattening the
+  // generated declarations as well as to inline JSON definitions above.
+  const schemaOutputWithAsyncQuestions = schemaOutputForAsyncAgentMessages(
+    [
+      ...prelude,
+      'import * as Schema from "effect/Schema";',
+      "",
+      [...generatedEntries.values()].join("\n\n"),
+      "",
+    ].join("\n"),
+  );
+
+  const schemaOutput = schemaOutputWithAsyncQuestions;
 
   const metaOutput = [
     ...prelude,
@@ -902,6 +949,7 @@ const generateFiles = Effect.fn("generateFiles")(function* () {
   ].join("\n");
 
   const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const { generatedDir, metaOutputPath, namespacesOutputPath, schemaOutputPath } =
     yield* getGeneratedPaths();
   yield* fs.writeFileString(schemaOutputPath, schemaOutput);
@@ -912,15 +960,38 @@ const generateFiles = Effect.fn("generateFiles")(function* () {
 
   yield* Effect.service(ChildProcessSpawner.ChildProcessSpawner).pipe(
     Effect.flatMap((spawner) =>
-      spawner.spawn(ChildProcess.make("vp", ["fmt", generatedDir, "--write"])),
+      // Windows' command shim is unreliable from uv_spawn. Invoke the local
+      // Vite+ entrypoint through Node resolved from PATH. The generator is
+      // run under Bun, while the formatter uses the repository's Node 24
+      // toolchain.
+      process.platform === "win32"
+        ? spawner.spawn(
+            ChildProcess.make("node", [
+              path.join(
+                generatedDir,
+                "..",
+                "..",
+                "..",
+                "..",
+                "node_modules",
+                "vite-plus",
+                "bin",
+                "vp",
+              ),
+              "fmt",
+              generatedDir,
+              "--write",
+            ]),
+          )
+        : spawner.spawn(ChildProcess.make("vp", ["fmt", generatedDir, "--write"])),
     ),
     Effect.flatMap((child) => child.exitCode),
-    Effect.tap((code) =>
+    Effect.flatMap((code) =>
       code === 0
         ? Effect.void
         : Effect.fail(
             new GeneratorError({
-              detail: `vp fmt failed with exit code ${code}`,
+              detail: `vp fmt failed with exit code ${code}.`,
             }),
           ),
     ),

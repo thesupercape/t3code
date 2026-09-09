@@ -20,6 +20,7 @@ import {
   isTerminalToggleShortcut,
   resolveShortcutCommand,
   shouldShowThreadJumpHintsForModifiers,
+  shouldShowThreadJumpHints,
   shortcutLabelForCommand,
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
@@ -526,6 +527,21 @@ describe("thread navigation helpers", () => {
       shouldShowThreadJumpHintsForModifiers(event({ metaKey: true }), DEFAULT_BINDINGS, {
         platform: "MacIntel",
         context: { terminalFocus: false },
+      }),
+    );
+  });
+
+  it("follows contextual shortcut ownership for terminal and model-picker surfaces", () => {
+    assert.isTrue(
+      shouldShowThreadJumpHints(event({ metaKey: true }), DEFAULT_BINDINGS, {
+        platform: "MacIntel",
+        context: { terminalOpen: true, terminalFocus: false },
+      }),
+    );
+    assert.isFalse(
+      shouldShowThreadJumpHints(event({ metaKey: true }), DEFAULT_BINDINGS, {
+        platform: "MacIntel",
+        context: { modelPickerOpen: true },
       }),
     );
   });

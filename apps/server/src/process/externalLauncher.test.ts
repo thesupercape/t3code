@@ -121,6 +121,61 @@ it.effect("launches the default browser through the platform command", () => {
   );
 });
 
+it.effect("launches an exact URL through the installed Windows Chrome executable", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const programFilesX86 = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-chrome-" });
+    const chromePath = path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe");
+    yield* fileSystem.makeDirectory(path.dirname(chromePath), { recursive: true });
+    yield* fileSystem.writeFileString(chromePath, "");
+
+    let spawned: ChildProcess.StandardCommand | undefined;
+    const url = "https://example.com/sso?RelayState=exact-value";
+    yield* Effect.gen(function* () {
+      const launcher = yield* ExternalLauncher.ExternalLauncher;
+      yield* launcher.launchBrowser(url, { application: "chrome" });
+    }).pipe(
+      Effect.provide(
+        testLayer({
+          platform: "win32",
+          env: { "ProgramFiles(x86)": programFilesX86 },
+          onSpawn: (command) => {
+            spawned = command;
+          },
+        }),
+      ),
+    );
+
+    assert.ok(spawned);
+    assert.equal(spawned.command, chromePath);
+    assert.deepEqual(spawned.args, [url]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("fails before spawning when Google Chrome is not installed", () => {
+  let spawned = false;
+  return Effect.gen(function* () {
+    const launcher = yield* ExternalLauncher.ExternalLauncher;
+    const error = yield* launcher
+      .launchBrowser("https://example.com", { application: "chrome" })
+      .pipe(Effect.flip);
+
+    assert.instanceOf(error, ExternalLauncher.ExternalLauncherBrowserNotFoundError);
+    assert.equal(spawned, false);
+  }).pipe(
+    Effect.provide(
+      testLayer({
+        platform: "win32",
+        env: {},
+        onSpawn: () => {
+          spawned = true;
+        },
+      }),
+    ),
+  );
+});
+
 it.effect("launches an installed editor with platform-safe arguments", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;

@@ -124,24 +124,40 @@ function canonicalSelectionsToLegacyObject(
 
 export const ModelCapabilities = Schema.Struct({
   optionDescriptors: Schema.optional(Schema.Array(ProviderOptionDescriptor)),
+  subagentBackends: Schema.optional(
+    Schema.Struct({
+      v1: Schema.Struct({
+        supported: Schema.Boolean,
+        reason: Schema.optional(TrimmedNonEmptyString),
+      }),
+      v2: Schema.Struct({
+        supported: Schema.Boolean,
+        reason: Schema.optional(TrimmedNonEmptyString),
+      }),
+      "native-v1-control": Schema.Struct({
+        supported: Schema.Boolean,
+        reason: Schema.optional(TrimmedNonEmptyString),
+      }),
+    }),
+  ),
 });
 export type ModelCapabilities = typeof ModelCapabilities.Type;
 
-/**
- * A user-authored custom model. `name` and `capabilities` are optional so a
- * bare slug keeps its driver-default presentation; when `capabilities` is
- * set, its descriptors replace the driver default in the model picker.
- */
 export const CustomModelEntry = Schema.Struct({
   slug: TrimmedNonEmptyString,
   name: Schema.optional(TrimmedNonEmptyString),
   capabilities: Schema.optional(ModelCapabilities),
 });
 export type CustomModelEntry = typeof CustomModelEntry.Type;
-
-/** On-disk custom model setting: the legacy bare slug, or a full entry. */
 export const CustomModelSetting = Schema.Union([Schema.String, CustomModelEntry]);
 export type CustomModelSetting = typeof CustomModelSetting.Type;
+
+/**
+ * The user-selectable sub-agent control paths. These are runtime routes, not
+ * prompt hints: the server validates the selected route before a turn starts.
+ */
+export const SubagentBackend = Schema.Literals(["v1", "v2", "native-v1-control"]);
+export type SubagentBackend = typeof SubagentBackend.Type;
 
 const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
@@ -169,7 +185,6 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [CODEX_DRIVER_KIND]: DEFAULT_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-sonnet-5",
   [CURSOR_DRIVER_KIND]: "auto",
-  // Product slug, not an ACP model id. The Grok adapter treats it as "the session's current model".
   [GROK_DRIVER_KIND]: "grok-build",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
@@ -180,7 +195,6 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   Record<ProviderDriverKind, string>
 > = {
   [CODEX_DRIVER_KIND]: DEFAULT_TEXT_GENERATION_MODEL,
-  [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
@@ -197,7 +211,30 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "5.3-spark": "gpt-5.3-codex-spark",
     "gpt-5.3-spark": "gpt-5.3-codex-spark",
   },
-  [CLAUDE_DRIVER_KIND]: {},
+  [CLAUDE_DRIVER_KIND]: {
+    opus: "claude-opus-5",
+    "opus-5": "claude-opus-5",
+    "claude-opus-5.0": "claude-opus-5",
+    "claude-opus-5-0": "claude-opus-5",
+    "opus-4.8": "claude-opus-4-8",
+    "claude-opus-4.8": "claude-opus-4-8",
+    "opus-4.7": "claude-opus-4-7",
+    "claude-opus-4.7": "claude-opus-4-7",
+    "opus-4.6": "claude-opus-4-6",
+    "claude-opus-4.6": "claude-opus-4-6",
+    "claude-opus-4-6-20251117": "claude-opus-4-6",
+    sonnet: "claude-sonnet-5",
+    "sonnet-5": "claude-sonnet-5",
+    "claude-sonnet-5.0": "claude-sonnet-5",
+    "claude-sonnet-5-0": "claude-sonnet-5",
+    "sonnet-4.6": "claude-sonnet-4-6",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+    "claude-sonnet-4-6-20251117": "claude-sonnet-4-6",
+    haiku: "claude-haiku-4-5",
+    "haiku-4.5": "claude-haiku-4-5",
+    "claude-haiku-4.5": "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+  },
   [CURSOR_DRIVER_KIND]: {
     composer: "composer-2",
     "composer-1.5": "composer-1.5",
@@ -215,7 +252,6 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
 // ── Provider display names ────────────────────────────────────────────
 
 export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>> = {
-  [ProviderDriverKind.make("antigravity")]: "Antigravity",
   [CODEX_DRIVER_KIND]: "Codex",
   [CLAUDE_DRIVER_KIND]: "Claude",
   [CURSOR_DRIVER_KIND]: "Cursor",

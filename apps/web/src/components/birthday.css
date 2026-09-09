@@ -1,0 +1,169 @@
+/* The birthday panel follows the selected T3 theme. */
+html[data-birthday] {
+  --birthday-ink: var(--foreground);
+  --birthday-soft: var(--card);
+  --birthday-paper: var(--muted);
+  --birthday-star: #d88d42;
+}
+.birthday-greeting {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 0;
+  padding: 16px 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--birthday-soft);
+}
+.birthday-greeting-copy {
+  min-width: 0;
+  flex: 1;
+}
+.birthday-eyebrow {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--muted-foreground);
+}
+.birthday-greeting h2 {
+  margin-top: 4px;
+  color: var(--birthday-ink);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1.15;
+}
+.birthday-greeting h2 span {
+  color: var(--birthday-star);
+}
+.birthday-greeting-copy > p:last-of-type {
+  max-width: 26em;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.birthday-settings-link {
+  flex-basis: 100%;
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+  color: var(--muted-foreground);
+}
+.birthday-wish {
+  display: flex;
+  flex: 0 0 82px;
+  flex-direction: column;
+  align-items: center;
+  color: var(--birthday-ink);
+  border-radius: 12px;
+  padding: 4px;
+}
+.birthday-note-toggle {
+  min-height: 44px;
+  margin-top: 4px;
+  color: var(--birthday-ink);
+  font-size: 11px;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+}
+.birthday-note {
+  flex-basis: 100%;
+  padding: 16px;
+  background: var(--birthday-paper);
+  border-left: 2px solid var(--birthday-star);
+  border-radius: 4px;
+}
+.birthday-note p {
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  font-family: var(--font-mono, monospace);
+  line-height: 1.65;
+}
+.birthday-note button {
+  min-height: 44px;
+  margin-top: 4px;
+  color: var(--birthday-ink);
+  font-size: 11px;
+}
+.birthday-wish:hover {
+  background: var(--accent);
+}
+.birthday-wish span {
+  font-size: 10px;
+  white-space: nowrap;
+}
+.birthday-cake {
+  width: 76px;
+  height: 82px;
+}
+.birthday-confetti {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+}
+.birthday-burst {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+.birthday-burst i {
+  position: absolute;
+  width: 5px;
+  height: 8px;
+  animation: birthday-scatter 800ms ease-out both;
+}
+@keyframes birthday-scatter {
+  from {
+    opacity: 1;
+    transform: translate(0, 0) rotate(0);
+  }
+  to {
+    opacity: 0;
+    transform: translate(var(--confetti-x), var(--confetti-y)) rotate(var(--confetti-turn));
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html[data-birthday-effects]
+    :is(button, [role="button"]):not(:disabled):not([aria-disabled="true"]):active {
+    scale: 0.97;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .birthday-confetti {
+    display: none;
+  }
+  .birthday-burst i {
+    animation: none;
+  }
+}
+@media (max-width: 380px) {
+  .birthday-greeting {
+    padding: 14px;
+    gap: 8px;
+  }
+  .birthday-wish {
+    flex-basis: 70px;
+  }
+  .birthday-cake {
+    width: 64px;
+  }
+}
+
+.birthday-status {
+  margin-left: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: var(--foreground);
+}

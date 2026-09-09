@@ -436,6 +436,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     }
 
     if (item.kind === "snapshot") {
+      const currentSequence = yield* SubscriptionRef.get(lastSequence);
+      if (item.snapshot.snapshotSequence < currentSequence) {
+        return;
+      }
       // A fresh snapshot replaces all loaded history, including older
       // pages: a turn reverted while disconnected would otherwise survive
       // in the preserved history with no event left to remove it. The
@@ -657,7 +661,10 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const foregroundResubscriptions = Option.match(wakeups, {
     onNone: () => Stream.never,
     onSome: (service) =>
-      service.changes.pipe(Stream.filter(ConnectionWakeups.shouldResubscribeAfterWakeup)),
+      service.changes.pipe(
+        Stream.changes,
+        Stream.filter(ConnectionWakeups.shouldResubscribeAfterWakeup),
+      ),
   });
 
   // Only the first subscription after a warm live resume keeps the retained

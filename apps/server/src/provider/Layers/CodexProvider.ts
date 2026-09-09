@@ -20,42 +20,36 @@ import type {
   ServerProviderState,
   ModelCapabilities,
   ProviderOptionDescriptor,
+  ProviderOptionChoice,
   ServerProviderModel,
   ServerProviderSkill,
 } from "@t3tools/contracts";
 import { PREFERRED_DEFAULT_CODEX_MODELS, ServerSettingsError } from "@t3tools/contracts";
 
-import { createModelCapabilities, readCustomModelEntries } from "@t3tools/shared/model";
+import { createModelCapabilities } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
-import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import { codexLaunchArgv, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import { CODEX_COMPUTER_CONTROL_OPTION_ID } from "../CodexComputerControl.ts";
+import {
+  type CodexMcpToolInventory,
+  hasT3PreviewBrowserTools,
+  resolveCodexBrowserCapabilities,
+} from "../CodexBrowserCapabilities.ts";
 import {
   AUTH_PROBE_TIMEOUT_MS,
   buildServerProvider,
-  COMPACT_SLASH_COMMAND,
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
-import { makeUnavailableUsageLimits } from "../providerUsageLimits.ts";
 import {
-  codexRateLimitsFailureMessage,
-  codexRateLimitsToLimits,
-  type CodexRateLimitSnapshot,
-  type CodexResetCreditsSummary,
-} from "./codexUsageLimits.ts";
+  codexAppServerCommandArgs,
+  codexAppServerTransport,
+  type CodexAppServerTransport,
+} from "../CodexAppServerTransport.ts";
+import { withCodexSandboxStartupRecovery } from "./CodexSandboxRecovery.ts";
+import { codexMcpDisableOverride, preflightCodexMcpServers } from "./CodexMcpPreflight.ts";
 import packageJson from "../../../package.json" with { type: "json" };
 const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnError);
-const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
-
-type CodexRateLimitsProbe =
-  | {
-      readonly snapshot: CodexRateLimitSnapshot;
-      readonly rateLimitsByLimitId?:
-        | Readonly<Record<string, CodexRateLimitSnapshot>>
-        | null
-        | undefined;
-      readonly resetCredits: CodexResetCreditsSummary | null | undefined;
-    }
-  | { readonly failure: string };
 
 const CODEX_APP_SERVER_PROBE_FORCE_KILL_AFTER = "2 seconds" as const;
 
@@ -67,7 +61,6 @@ const CODEX_PRESENTATION = {
 
 export interface CodexAppServerProviderSnapshot {
   readonly account: CodexSchema.V2GetAccountResponse;
-  readonly rateLimits?: CodexRateLimitsProbe;
   readonly version: string | undefined;
   readonly models: ReadonlyArray<ServerProviderModel>;
   readonly skills: ReadonlyArray<ServerProviderSkill>;
@@ -85,6 +78,17 @@ const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
 };
 
 const DEFAULT_SERVICE_TIER_ID = "default";
+const CURRENT_CODEX_MODELS = new Set([
+  "gpt-5.6-luna",
+  "gpt-5.6-terra",
+  "gpt-5.6-sol",
+  "gpt-daybreak-blue-latest",
+  "gpt-daybreak-red-latest",
+]);
+
+export function isLegacyCodexModel(model: string): boolean {
+  return !CURRENT_CODEX_MODELS.has(model);
+}
 
 function reasoningEffortLabel(reasoningEffort: string): string {
   return REASONING_EFFORT_LABELS[reasoningEffort] ?? reasoningEffort;
@@ -95,12 +99,8 @@ function codexAccountAuthLabel(account: CodexSchema.V2GetAccountResponse["accoun
   if (account.type === "apiKey") return "OpenAI API Key";
   if (account.type === "amazonBedrock") return "Amazon Bedrock";
   if (account.type !== "chatgpt") return undefined;
-  return codexPlanLabel(account.planType);
-}
 
-/** Shared with usage-limit sources, which report the same `planType` slugs. */
-export function codexPlanLabel(planType: string | null | undefined): string | undefined {
-  switch (planType) {
+  switch (account.planType) {
     case "free":
       return "ChatGPT Free Subscription";
     case "go":
@@ -113,12 +113,9 @@ export function codexPlanLabel(planType: string | null | undefined): string | un
       return "ChatGPT Pro 5x Subscription";
     case "team":
       return "ChatGPT Team Subscription";
-    case "self_serve_business_prolite":
     case "self_serve_business_usage_based":
     case "business":
       return "ChatGPT Business Subscription";
-    case "ent26":
-    case "enterprise_cbp_automation":
     case "enterprise_cbp_usage_based":
     case "enterprise":
       return "ChatGPT Enterprise Subscription";
@@ -126,9 +123,14 @@ export function codexPlanLabel(planType: string | null | undefined): string | un
     case "edu_plus":
     case "edu_pro":
       return "ChatGPT Edu Subscription";
+    case "ent26":
+    case "enterprise_cbp_automation":
+    case "self_serve_business_prolite":
+      return "ChatGPT Enterprise Subscription";
     case "unknown":
       return "ChatGPT Subscription";
     default:
+      account.planType satisfies never;
       return undefined;
   }
 }
@@ -140,6 +142,7 @@ function codexAccountEmail(account: CodexSchema.V2GetAccountResponse["account"])
 
 export function mapCodexModelCapabilities(
   model: CodexSchema.V2ModelListResponse__Model,
+  browserTools: ReadonlyArray<CodexMcpToolInventory> = [],
 ): ModelCapabilities {
   const reasoningOptions = model.supportedReasoningEfforts.map(({ reasoningEffort }) =>
     reasoningEffort === model.defaultReasoningEffort
@@ -169,6 +172,22 @@ export function mapCodexModelCapabilities(
     : null;
   const defaultServiceTier = catalogDefaultServiceTier ?? DEFAULT_SERVICE_TIER_ID;
   const optionDescriptors: ProviderOptionDescriptor[] = [];
+  const multiAgentVersion = model.multiAgentVersion;
+  const unavailableMultiAgentReason = (requested: "V1" | "V2"): string => {
+    if (multiAgentVersion === undefined) {
+      return "The live Codex model catalog did not advertise a multi-agent version for this model.";
+    }
+    if (multiAgentVersion === null) {
+      return "The live Codex model catalog reported no multi-agent runtime for this model.";
+    }
+    if (multiAgentVersion === "disabled") {
+      return "The live Codex model catalog reports multi-agent support as disabled for this model.";
+    }
+    if (multiAgentVersion !== "v1" && multiAgentVersion !== "v2") {
+      return `The live Codex model catalog advertised unrecognized multi-agent version '${multiAgentVersion}'.`;
+    }
+    return `The live Codex model catalog advertises '${multiAgentVersion}', not ${requested}.`;
+  };
 
   if (reasoningOptions.length > 0) {
     optionDescriptors.push({
@@ -200,9 +219,55 @@ export function mapCodexModelCapabilities(
       currentValue: defaultServiceTier,
     });
   }
+  const browserOptions: ProviderOptionChoice[] = [];
+  for (const capability of resolveCodexBrowserCapabilities(browserTools)) {
+    if (capability.id === "t3-managed-chrome" && capability.available) {
+      browserOptions.push({
+        id: "chrome",
+        label: capability.label,
+        description:
+          "Use T3's separate persistent Chrome profile. This does not control your normal Chrome profile or Windows desktop.",
+      });
+    }
+  }
+  if (hasT3PreviewBrowserTools(browserTools)) {
+    browserOptions.push({
+      id: "preview",
+      label: "T3 Preview",
+      description: "Use T3's isolated collaborative preview browser.",
+    });
+  }
+  const defaultBrowser = browserOptions[0];
+  if (defaultBrowser) {
+    optionDescriptors.push({
+      id: CODEX_COMPUTER_CONTROL_OPTION_ID,
+      label: "Browser provider",
+      type: "select",
+      options: browserOptions.map((option) => ({
+        ...option,
+        ...(option.id === defaultBrowser.id ? { isDefault: true } : {}),
+      })),
+      currentValue: defaultBrowser.id,
+    });
+  }
 
   return createModelCapabilities({
     optionDescriptors,
+    subagentBackends: {
+      v1: {
+        supported: multiAgentVersion === "v1",
+        ...(multiAgentVersion === "v1" ? {} : { reason: unavailableMultiAgentReason("V1") }),
+      },
+      v2: {
+        supported: multiAgentVersion === "v2",
+        ...(multiAgentVersion === "v2" ? {} : { reason: unavailableMultiAgentReason("V2") }),
+      },
+      "native-v1-control": {
+        supported: true,
+        reason:
+          "Uses T3 Workers linked-provider control. This is separate from the Codex app-server V1 and V2 model runtimes.",
+      },
+    },
   });
 }
 
@@ -215,13 +280,15 @@ const toDisplayName = (model: CodexSchema.V2ModelListResponse__Model): string =>
 
 function parseCodexModelListResponse(
   response: CodexSchema.V2ModelListResponse,
+  browserTools: ReadonlyArray<CodexMcpToolInventory>,
 ): ReadonlyArray<ServerProviderModel> {
   return response.data.map((model) => ({
     slug: model.model,
     name: toDisplayName(model),
     isCustom: false,
     ...(model.isDefault ? { isDefault: true } : {}),
-    capabilities: mapCodexModelCapabilities(model),
+    ...(isLegacyCodexModel(model.model) ? { isLegacy: true } : {}),
+    capabilities: mapCodexModelCapabilities(model, browserTools),
   }));
 }
 
@@ -250,11 +317,6 @@ export function applyPreferredCodexDefaultModel(
   });
 }
 
-/**
- * Codex has no static default capability set, so a bare custom slug borrows
- * the first built-in's descriptors; an entry with its own capabilities keeps
- * them.
- */
 function appendCustomCodexModels(
   models: ReadonlyArray<ServerProviderModel>,
   customModels: ReadonlyArray<CustomModelSetting>,
@@ -266,16 +328,25 @@ function appendCustomCodexModels(
   const seen = new Set(models.map((model) => model.slug));
   const fallbackCapabilities = models.find((model) => model.capabilities)?.capabilities ?? null;
   const customEntries: ServerProviderModel[] = [];
-  for (const entry of readCustomModelEntries(customModels)) {
-    if (seen.has(entry.slug)) {
+  for (const rawModel of customModels) {
+    const slug = (typeof rawModel === "string" ? rawModel : rawModel.slug).trim();
+    if (!slug || seen.has(slug)) {
       continue;
     }
-    seen.add(entry.slug);
+    seen.add(slug);
     customEntries.push({
-      slug: entry.slug,
-      name: entry.name,
+      slug,
+      name: slug,
       isCustom: true,
-      capabilities: entry.capabilities ?? fallbackCapabilities,
+      // Custom slugs have no live model capability record. Keep the known
+      // option descriptors useful, but deliberately do not inherit native
+      // sub-agent support from another model.
+      capabilities:
+        fallbackCapabilities === null
+          ? null
+          : {
+              optionDescriptors: fallbackCapabilities.optionDescriptors,
+            },
     });
   }
   return customEntries.length === 0 ? models : [...models, ...customEntries];
@@ -319,6 +390,7 @@ function parseCodexSkillsListResponse(
 
 const requestAllCodexModels = Effect.fn("requestAllCodexModels")(function* (
   client: CodexClient.CodexAppServerClient["Service"],
+  browserTools: ReadonlyArray<CodexMcpToolInventory>,
 ) {
   const models: ServerProviderModel[] = [];
   let cursor: string | null | undefined = undefined;
@@ -328,7 +400,7 @@ const requestAllCodexModels = Effect.fn("requestAllCodexModels")(function* (
       "model/list",
       cursor ? { cursor } : {},
     );
-    models.push(...parseCodexModelListResponse(response));
+    models.push(...parseCodexModelListResponse(response, browserTools));
     cursor = response.nextCursor;
   } while (cursor);
 
@@ -344,145 +416,146 @@ export function buildCodexInitializeParams(): CodexSchema.V1InitializeParams {
     },
     capabilities: {
       experimentalApi: true,
+      mcpServerOpenaiFormElicitation: true,
     },
   };
 }
 
-/**
- * Spawns a short-lived `codex app-server`, runs the initialize handshake, and
- * hands the caller a connected client. Scoped: the process is killed when
- * the caller's scope closes. Shared by the status probe, the skills probe,
- * and account-level requests such as reset-credit redemption.
- */
-export const withCodexAppServerClient = Effect.fn("withCodexAppServerClient")(function* (input: {
-  readonly binaryPath: string;
-  readonly homePath?: string | undefined;
-  readonly launchArgs?: string | undefined;
-  readonly cwd: string;
-  readonly environment?: NodeJS.ProcessEnv | undefined;
-}) {
-  // `~` is not shell-expanded when env vars are set via `child_process.spawn`,
-  // so `CODEX_HOME=~/.codex_work` would reach codex verbatim and trip
-  // "CODEX_HOME points to '~/.codex_work', but that path does not exist".
-  // Expand here for parity with `CodexTextGeneration`/`CodexSessionRuntime`.
-  const resolvedHomePath = input.homePath ? expandHomePath(input.homePath) : undefined;
-  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-  const environment = {
-    ...input.environment,
-    ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
-  };
-  const spawnCommand = yield* resolveSpawnCommand(
-    input.binaryPath,
-    codexAppServerArgs(input.launchArgs),
-    { env: environment, extendEnv: true },
-  );
-  const child = yield* spawner
-    .spawn(
-      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+const probeCodexAppServerProviderOnce = Effect.fn("probeCodexAppServerProviderOnce")(
+  function* (input: {
+    readonly binaryPath: string;
+    readonly homePath?: string;
+    readonly launchArgs?: string;
+    readonly cwd: string;
+    readonly customModels?: ReadonlyArray<CustomModelSetting>;
+    readonly environment?: NodeJS.ProcessEnv;
+    readonly appServerTransport?: CodexAppServerTransport;
+    readonly browserTools: ReadonlyArray<CodexMcpToolInventory>;
+  }) {
+    // `~` is not shell-expanded when env vars are set via `child_process.spawn`,
+    // so `CODEX_HOME=~/.codex_work` would reach codex verbatim and trip
+    // "CODEX_HOME points to '~/.codex_work', but that path does not exist".
+    // Expand here for parity with `CodexTextGeneration`/`CodexSessionRuntime`.
+    const resolvedHomePath = input.homePath ? expandHomePath(input.homePath) : undefined;
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const environment = {
+      ...input.environment,
+      ...(resolvedHomePath ? { CODEX_HOME: resolvedHomePath } : {}),
+    };
+    const launchArgs = codexLaunchArgv(input.launchArgs);
+    const mcpPreflight = yield* Effect.promise(() =>
+      preflightCodexMcpServers({
+        ...(resolvedHomePath ? { homePath: resolvedHomePath } : {}),
         cwd: input.cwd,
-        env: environment,
-        extendEnv: true,
-        forceKillAfter: CODEX_APP_SERVER_PROBE_FORCE_KILL_AFTER,
-        shell: spawnCommand.shell,
+        environment,
+        appServerArgs: launchArgs,
       }),
-    )
-    .pipe(
-      Effect.mapError(
-        (cause) =>
-          new CodexErrors.CodexAppServerSpawnError({
-            command: `${input.binaryPath} app-server`,
-            cause,
-          }),
-      ),
     );
-  const clientContext = yield* Layer.build(CodexClient.layerChildProcess(child));
-  const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
-    Effect.provide(clientContext),
-  );
-  const initialize = yield* client.request("initialize", buildCodexInitializeParams());
-  yield* client.notify("initialized", undefined);
-  return { client, initialize };
-});
+    for (const diagnostic of mcpPreflight.unavailable) {
+      yield* Effect.logWarning("codex.mcp.unavailable", diagnostic);
+    }
+    const commandArgs = codexAppServerCommandArgs(input.appServerTransport ?? "stdio", [
+      ...launchArgs,
+      ...mcpPreflight.disabledServerNames.flatMap((name) => ["-c", codexMcpDisableOverride(name)]),
+    ]);
+    const spawnCommand = yield* resolveSpawnCommand(input.binaryPath, commandArgs, {
+      env: environment,
+      extendEnv: true,
+    });
+    const child = yield* spawner
+      .spawn(
+        ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+          cwd: input.cwd,
+          env: environment,
+          extendEnv: true,
+          forceKillAfter: CODEX_APP_SERVER_PROBE_FORCE_KILL_AFTER,
+          shell: spawnCommand.shell,
+        }),
+      )
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new CodexErrors.CodexAppServerSpawnError({
+              command: `${input.binaryPath} ${commandArgs.join(" ")}`,
+              cause,
+            }),
+        ),
+      );
+    const clientContext = yield* Layer.build(CodexClient.layerChildProcess(child));
+    const client = yield* Effect.service(CodexClient.CodexAppServerClient).pipe(
+      Effect.provide(clientContext),
+    );
 
-const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (input: {
-  readonly binaryPath: string;
-  readonly homePath?: string;
-  readonly launchArgs?: string;
-  readonly cwd: string;
-  readonly customModels?: ReadonlyArray<CustomModelSetting>;
-  readonly environment?: NodeJS.ProcessEnv;
-}) {
-  const { client, initialize } = yield* withCodexAppServerClient(input);
+    const initialize = yield* client.request("initialize", {
+      clientInfo: {
+        name: "t3code_desktop",
+        title: "T3 Code Desktop",
+        version: "0.1.0",
+      },
+      capabilities: {
+        experimentalApi: true,
+      },
+    });
+    yield* client.notify("initialized", undefined);
 
-  // Extract the version string after the first '/' in userAgent, up to the next space or the end
-  const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);
-  const version = versionMatch ? versionMatch[1] : undefined;
+    // Extract the version string after the first '/' in userAgent, up to the next space or the end
+    const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);
+    const version = versionMatch ? versionMatch[1] : undefined;
 
-  const accountResponse = yield* client.request("account/read", {});
-  if (!accountResponse.account && accountResponse.requiresOpenaiAuth) {
+    const accountResponse = yield* client.request("account/read", {});
+    if (!accountResponse.account && accountResponse.requiresOpenaiAuth) {
+      return {
+        account: accountResponse,
+        version,
+        models: appendCustomCodexModels([], input.customModels ?? []),
+        skills: [],
+      } satisfies CodexAppServerProviderSnapshot;
+    }
+
+    const [skillsResponse, models] = yield* Effect.all(
+      [
+        client.request("skills/list", {
+          cwds: [input.cwd],
+        }),
+        requestAllCodexModels(client, input.browserTools),
+      ],
+      { concurrency: "unbounded" },
+    );
+
     return {
       account: accountResponse,
       version,
-      models: appendCustomCodexModels([], input.customModels ?? []),
-      skills: [],
-    } satisfies CodexAppServerProviderSnapshot;
-  }
-
-  const [skillsResponse, models, rateLimits] = yield* Effect.all(
-    [
-      client.request("skills/list", {
-        cwds: [input.cwd],
-      }),
-      requestAllCodexModels(client),
-      // Usage is an enrichment: a failure or a slow answer degrades to "no
-      // usage this probe" rather than costing the account and models.
-      client.request("account/rateLimits/read", undefined).pipe(
-        Effect.map((response): CodexRateLimitsProbe => ({
-          snapshot: response.rateLimits,
-          rateLimitsByLimitId: response.rateLimitsByLimitId,
-          resetCredits: response.rateLimitResetCredits,
-        })),
-        Effect.timeoutOption(Duration.millis(RATE_LIMITS_PROBE_TIMEOUT_MS)),
-        Effect.map(
-          Option.getOrElse((): CodexRateLimitsProbe => ({
-            failure: "Codex did not answer the usage request.",
-          })),
-        ),
-        Effect.catch((error) =>
-          Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-            Effect.as<CodexRateLimitsProbe>({ failure: codexRateLimitsFailureMessage(error) }),
-          ),
-        ),
+      models: applyPreferredCodexDefaultModel(
+        appendCustomCodexModels(models, input.customModels ?? []),
       ),
-    ],
-    { concurrency: "unbounded" },
-  );
+      skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
+    } satisfies CodexAppServerProviderSnapshot;
+  },
+);
 
-  return {
-    account: accountResponse,
-    rateLimits,
-    version,
-    models: applyPreferredCodexDefaultModel(
-      appendCustomCodexModels(models, input.customModels ?? []),
-    ),
-    skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
-  } satisfies CodexAppServerProviderSnapshot;
+const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (
+  input: Parameters<typeof probeCodexAppServerProviderOnce>[0],
+) {
+  return yield* withCodexSandboxStartupRecovery({
+    run: () => probeCodexAppServerProviderOnce(input).pipe(Effect.scoped),
+  });
 });
 
-export const probeCodexSkillsForCwd = Effect.fn("probeCodexSkillsForCwd")(function* (input: {
-  readonly binaryPath: string;
-  readonly homePath?: string;
-  readonly launchArgs?: string;
-  readonly cwd: string;
-  readonly environment?: NodeJS.ProcessEnv;
-}) {
-  const { client } = yield* withCodexAppServerClient(input);
-  const skillsResponse = yield* client.request("skills/list", { cwds: [input.cwd] });
-  return parseCodexSkillsListResponse(skillsResponse, input.cwd);
-});
-
-const emptyCodexModelsFromSettings = (codexSettings: CodexSettings): ServerProvider["models"] =>
-  appendCustomCodexModels([], codexSettings.customModels);
+const emptyCodexModelsFromSettings = (codexSettings: CodexSettings): ServerProvider["models"] => {
+  const models = new Set<string>();
+  for (const model of codexSettings.customModels) {
+    const trimmed = (typeof model === "string" ? model : model.slug).trim();
+    if (trimmed.length > 0) {
+      models.add(trimmed);
+    }
+  }
+  return Array.from(models, (model) => ({
+    slug: model,
+    name: model,
+    isCustom: true,
+    capabilities: null,
+  }));
+};
 
 const makePendingCodexProvider = (
   codexSettings: CodexSettings,
@@ -562,12 +635,15 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     readonly cwd: string;
     readonly customModels: ReadonlyArray<CustomModelSetting>;
     readonly environment?: NodeJS.ProcessEnv;
+    readonly appServerTransport?: CodexAppServerTransport;
+    readonly browserTools: ReadonlyArray<CodexMcpToolInventory>;
   }) => Effect.Effect<
     CodexAppServerProviderSnapshot,
     CodexErrors.CodexAppServerError,
     ChildProcessSpawner.ChildProcessSpawner | Scope.Scope
   > = probeCodexAppServerProvider,
   environment?: NodeJS.ProcessEnv,
+  browserTools: ReadonlyArray<CodexMcpToolInventory> = [],
 ): Effect.fn.Return<
   ServerProviderDraft,
   ServerSettingsError,
@@ -601,6 +677,8 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     cwd: process.cwd(),
     customModels: codexSettings.customModels,
     environment: resolvedEnvironment,
+    appServerTransport: codexAppServerTransport(codexSettings),
+    browserTools,
   }).pipe(
     Effect.scoped,
     Effect.timeoutOption(Duration.millis(AUTH_PROBE_TIMEOUT_MS)),
@@ -647,21 +725,6 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
 
   const snapshot = probeResult.success.value;
   const accountStatus = accountProbeStatus(snapshot.account);
-  const usageLimits =
-    snapshot.account.account?.type === "apiKey"
-      ? makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" })
-      : snapshot.rateLimits === undefined || "failure" in snapshot.rateLimits
-        ? makeUnavailableUsageLimits({
-            checkedAt,
-            reason: "probeFailed",
-            ...(snapshot.rateLimits ? { message: snapshot.rateLimits.failure } : {}),
-          })
-        : codexRateLimitsToLimits({
-            snapshot: snapshot.rateLimits.snapshot,
-            rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
-            resetCredits: snapshot.rateLimits.resetCredits,
-            checkedAt,
-          });
 
   return buildServerProvider({
     presentation: CODEX_PRESENTATION,
@@ -670,7 +733,6 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
     models: snapshot.models,
     skills: snapshot.skills,
     slashCommands: [
-      COMPACT_SLASH_COMMAND,
       {
         name: "feedback",
         description: "Send this thread and Codex logs to OpenAI",
@@ -683,7 +745,6 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
       status: accountStatus.status,
       auth: accountStatus.auth,
       ...(accountStatus.message ? { message: accountStatus.message } : {}),
-      usageLimits,
     },
   });
 });

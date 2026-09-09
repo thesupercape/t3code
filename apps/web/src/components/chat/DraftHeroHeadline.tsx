@@ -29,13 +29,13 @@ import {
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 interface DraftHeroHeadlineProps {
-  readonly draftId: DraftId | null;
+  readonly draftId?: DraftId | null;
   readonly activeProjectRef: ScopedProjectRef | null;
   readonly activeProjectTitle: string | null;
 }
 
 export function DraftHeroHeadline({
-  draftId,
+  draftId = null,
   activeProjectRef,
   activeProjectTitle,
 }: DraftHeroHeadlineProps) {
