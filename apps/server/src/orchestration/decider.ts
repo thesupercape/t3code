@@ -1167,6 +1167,59 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       return [...lifecycleResetEvents, userMessageEvent, turnStartRequestedEvent];
     }
 
+    case "thread.turn.steer": {
+      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
+      if (
+        thread.editFromHere != null ||
+        thread.session?.status !== "running" ||
+        thread.session.activeTurnId !== command.expectedTurnId
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "The requested turn is no longer running. Steering was not sent or queued.",
+        });
+      }
+      const userMessageEvent: Omit<OrchestrationEvent, "sequence"> = {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.message-sent",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          role: "user",
+          text: command.text,
+          attachments: [],
+          turnId: command.expectedTurnId,
+          streaming: false,
+          createdAt: command.createdAt,
+          updatedAt: command.createdAt,
+        },
+      };
+      return [
+        userMessageEvent,
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+          })),
+          type: "thread.turn-steer-requested",
+          causationEventId: userMessageEvent.eventId,
+          payload: {
+            threadId: command.threadId,
+            expectedTurnId: command.expectedTurnId,
+            messageId: command.messageId,
+            createdAt: command.createdAt,
+          },
+        },
+      ];
+    }
+
     case "thread.turn.interrupt": {
       yield* requireThread({
         readModel,
@@ -1436,6 +1489,66 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           turnCount: command.turnCount,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.edit-from-here": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (thread.editFromHere != null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' already has an Edit from here operation in progress.`,
+        });
+      }
+      if (thread.session?.status === "running" || thread.session?.status === "starting") {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' must be idle before editing from an earlier message.`,
+        });
+      }
+      const sourceMessage = thread.messages.find(
+        (message) => message.id === command.sourceMessageId,
+      );
+      if (!sourceMessage || sourceMessage.role !== "user") {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `User message '${command.sourceMessageId}' does not exist on thread '${command.threadId}'.`,
+        });
+      }
+      if (
+        command.mode === "branch" &&
+        readModel.threads.some((candidate) => candidate.id === command.targetThreadId)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Target thread '${command.targetThreadId}' already exists.`,
+        });
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.edit-from-here-requested",
+        payload: {
+          threadId: command.threadId,
+          requestId: command.commandId,
+          sourceMessageId: command.sourceMessageId,
+          replacementMessageId: command.replacementMessageId,
+          editedText: command.editedText,
+          mode: command.mode,
+          ...(command.mode === "branch" ? { targetThreadId: command.targetThreadId } : {}),
+          ...(command.subagentBackend !== undefined
+            ? { subagentBackend: command.subagentBackend }
+            : {}),
           createdAt: command.createdAt,
         },
       };
@@ -1738,6 +1851,41 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           turnCount: command.turnCount,
+        },
+      };
+    }
+
+    case "thread.edit-from-here.finish": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (thread.editFromHere?.requestId !== command.requestId) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Edit from here request '${command.requestId}' is no longer active on thread '${command.threadId}'.`,
+        });
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.edit-from-here-finished",
+        payload: {
+          threadId: command.threadId,
+          requestId: command.requestId,
+          ...(command.targetThreadId !== undefined
+            ? { targetThreadId: command.targetThreadId }
+            : {}),
+          ...(command.error !== undefined ? { error: command.error } : {}),
+          ...(command.workspaceRestore !== undefined
+            ? { workspaceRestore: command.workspaceRestore }
+            : {}),
+          finishedAt: command.createdAt,
         },
       };
     }

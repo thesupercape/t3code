@@ -34,10 +34,12 @@ import {
   type ProviderSession,
   type RuntimeMode,
 } from "@t3tools/contracts";
+import { expandAssistantCitationsForProvider } from "@t3tools/shared/assistantCitations";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -406,6 +408,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
   const revokeMcpCredential =
     options?.revokeMcpCredential ?? McpSessionRegistry.revokeActiveMcpThread;
+  const fileSystem = yield* FileSystem.FileSystem;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const pendingCompactions = new Map<ThreadId, PendingCompaction>();
   const timedOutNativeCompactions = new Set<ThreadId>();
