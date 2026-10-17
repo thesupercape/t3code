@@ -6,6 +6,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
+import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
 import { FetchHttpClient } from "effect/unstable/http";
 import {
   AuthSessionId,
@@ -14,7 +17,15 @@ import {
   EnvironmentAuthInvalidError,
 } from "@t3tools/contracts";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
-import { resolveAgentTarget, withAgentSession, executeAgentRequest } from "./agent.ts";
+import { SessionCredentialIssueError } from "../auth/SessionStore.ts";
+import { PersistenceSqlError } from "../persistence/Errors.ts";
+import {
+  resolveAgentTarget,
+  withAgentSession,
+  executeAgentRequest,
+  summarizeAgentSessionIssueFailure,
+  isRetryableAgentSessionInsertFailure,
+} from "./agent.ts";
 import {
   agentCommandSchema,
   decodeAgentAction,
@@ -72,12 +83,204 @@ function fakeAuth() {
   return { auth, issued, revoked };
 }
 
+function sessionInsertFailure(code = 5, operation = "AuthSessionRepository.create:query") {
+  const native = Object.assign(new Error("private SQL and token"), {
+    code: "ERR_SQLITE_ERROR",
+    errcode: code,
+  });
+  return new EnvironmentAuth.ServerAuthSessionTokenIssueError({
+    cause: new SessionCredentialIssueError({
+      cause: new PersistenceSqlError({
+        operation,
+        cause: new SqlError({ reason: classifySqliteError(native, { operation: "execute" }) }),
+      }),
+    }),
+  });
+}
+
 const testLayer = Layer.mergeAll(fs, Path.layer, FetchHttpClient.layer);
 const mockFetch = (
   handler: (url: string | Request | URL, options?: RequestInit) => Promise<Response>,
 ): typeof fetch => Object.assign(handler, { preconnect: () => {} });
 
 describe("agent authentication", () => {
+  it("only retries a known failed auth insert with a native SQLite busy or locked code", () => {
+    expect(isRetryableAgentSessionInsertFailure(sessionInsertFailure())).toBe(true);
+    expect(isRetryableAgentSessionInsertFailure(sessionInsertFailure(6))).toBe(true);
+    expect(isRetryableAgentSessionInsertFailure(sessionInsertFailure(517))).toBe(true);
+    expect(isRetryableAgentSessionInsertFailure(sessionInsertFailure(19))).toBe(false);
+    expect(
+      isRetryableAgentSessionInsertFailure(
+        sessionInsertFailure(5, "AuthSessionRepository.revoke:query"),
+      ),
+    ).toBe(false);
+    expect(isRetryableAgentSessionInsertFailure({ errcode: 5 })).toBe(false);
+  });
+  it.effect("retries busy acquisition then runs and revokes exactly once", () =>
+    Effect.gen(function* () {
+      const state = fakeAuth();
+      let attempts = 0;
+      let runs = 0;
+      const fiber = yield* withAgentSession(
+        {
+          ...state.auth,
+          issueSession: (input) =>
+            ++attempts < 3 ? Effect.fail(sessionInsertFailure()) : state.auth.issueSession(input),
+        },
+        false,
+        () =>
+          Effect.sync(() => {
+            runs++;
+          }),
+      ).pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.join(fiber);
+      expect(attempts).toBe(3);
+      expect(runs).toBe(1);
+      expect(state.revoked).toEqual(["session-a"]);
+    }),
+  );
+  it.effect("bounds exhausted busy acquisition at three attempts and never runs", () =>
+    Effect.gen(function* () {
+      const state = fakeAuth();
+      let attempts = 0;
+      let runs = 0;
+      const fiber = yield* Effect.result(
+        withAgentSession(
+          {
+            ...state.auth,
+            issueSession: () => {
+              attempts++;
+              return Effect.fail(sessionInsertFailure());
+            },
+          },
+          false,
+          () =>
+            Effect.sync(() => {
+              runs++;
+            }),
+        ),
+      ).pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 second");
+      const result = yield* Fiber.join(fiber);
+      expect(attempts).toBe(3);
+      expect(runs).toBe(0);
+      expect(state.revoked).toEqual([]);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure.message).toContain("remained busy after 3 attempts");
+        expect(result.failure.message).toContain("SQLITE(5)");
+        expect(result.failure.message).not.toContain("private");
+      }
+    }),
+  );
+  it.effect("does not retry a permanent auth insertion failure", () =>
+    Effect.gen(function* () {
+      const state = fakeAuth();
+      let attempts = 0;
+      yield* Effect.result(
+        withAgentSession(
+          {
+            ...state.auth,
+            issueSession: () => {
+              attempts++;
+              return Effect.fail(sessionInsertFailure(19));
+            },
+          },
+          false,
+          () => Effect.void,
+        ),
+      );
+      expect(attempts).toBe(1);
+      expect(state.revoked).toEqual([]);
+    }),
+  );
+  it.effect("never retries an unknown dispatched result and still revokes once", () =>
+    Effect.gen(function* () {
+      const state = fakeAuth();
+      let runs = 0;
+      const result = yield* Effect.result(
+        withAgentSession(state.auth, true, () => {
+          runs++;
+          return Effect.fail(sessionInsertFailure());
+        }),
+      );
+      expect(result._tag).toBe("Failure");
+      expect(state.issued).toHaveLength(1);
+      expect(runs).toBe(1);
+      expect(state.revoked).toEqual(["session-a"]);
+    }),
+  );
+  it("redacts error payloads while retaining Node SQLite condition and known tags", () => {
+    const native = {
+      code: "ERR_SQLITE_ERROR",
+      errcode: 5,
+      message: "private SQL and token",
+      stack: "private stack",
+    };
+    const cause = [
+      "UnknownError",
+      "SqlError",
+      "PersistenceSqlError",
+      "SessionCredentialIssueError",
+      "ServerAuthSessionTokenIssueError",
+    ].reduce<unknown>((cause, _tag) => ({ _tag, cause, message: "private payload" }), native);
+    expect(summarizeAgentSessionIssueFailure(cause)).toBe(
+      " [ServerAuthSessionTokenIssueError > SessionCredentialIssueError > PersistenceSqlError > SqlError > UnknownError > SQLITE(5)]",
+    );
+    expect(
+      summarizeAgentSessionIssueFailure({
+        _tag: "private-token",
+        message: "private payload",
+        errno: "private",
+      }),
+    ).toBe("");
+    expect(summarizeAgentSessionIssueFailure({ name: "SQLiteError", errno: 517 })).toBe(
+      " [SQLITE(517)]",
+    );
+  });
+  it("bounds cycles and omits unknown codes", () => {
+    const error: { _tag: string; errcode: number; cause?: unknown } = {
+      _tag: "SqlError",
+      errcode: 999999,
+    };
+    error.cause = error;
+    expect(summarizeAgentSessionIssueFailure(error)).toBe(" [SqlError]");
+  });
+  it.effect("reports a redacted acquisition failure without running or revoking a session", () =>
+    Effect.gen(function* () {
+      const state = fakeAuth();
+      let runs = 0;
+      const result = yield* Effect.result(
+        withAgentSession(
+          {
+            ...state.auth,
+            issueSession: () =>
+              Effect.fail(
+                new EnvironmentAuth.ServerAuthSessionTokenIssueError({
+                  cause: {
+                    _tag: "SessionCredentialIssueError",
+                    cause: { errcode: 5, message: "private-token" },
+                  },
+                }),
+              ),
+          },
+          false,
+          () =>
+            Effect.sync(() => {
+              runs++;
+            }),
+        ),
+      );
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure")
+        expect(result.failure.message).toBe(
+          "Could not issue a short-lived agent session. [ServerAuthSessionTokenIssueError > SessionCredentialIssueError > SQLITE(5)]",
+        );
+      expect(runs).toBe(0);
+      expect(state.revoked).toEqual([]);
+    }),
+  );
   it.effect("checks the descriptor without transmitting a token", () =>
     Effect.gen(function* () {
       const requests: Array<RequestInit | undefined> = [];

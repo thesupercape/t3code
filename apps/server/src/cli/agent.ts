@@ -18,11 +18,15 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Schedule from "effect/Schedule";
+import { isSqlError } from "effect/unstable/sql/SqlError";
 import { Command, Flag, GlobalFlag } from "effect/unstable/cli";
 import { FetchHttpClient } from "effect/unstable/http";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import { SessionCredentialIssueError } from "../auth/SessionStore.ts";
+import { PersistenceSqlError } from "../persistence/Errors.ts";
 import * as ServerConfig from "../config.ts";
 import { readPersistedServerRuntimeState } from "../serverRuntimeState.ts";
 import { resolveCliAuthConfig } from "./config.ts";
@@ -135,25 +139,111 @@ export const resolveAgentTarget = Effect.fn("resolveAgentTarget")(function* (bas
 });
 type AgentTarget = Effect.Success<ReturnType<typeof resolveAgentTarget>>;
 
+const sessionIssueErrorTags = new Set([
+  "ServerAuthSessionTokenIssueError",
+  "SessionCredentialIssueError",
+  "SessionClaimsEncodingError",
+  "PersistenceSqlError",
+  "PersistenceDecodeError",
+  "SqlError",
+  "LockTimeoutError",
+  "UnknownError",
+  "ConnectionError",
+  "ConstraintError",
+  "UniqueViolation",
+  "SqlSyntaxError",
+  "AuthorizationError",
+  "AuthenticationError",
+]);
+
+/** Only fixed error tags and SQLite condition numbers may reach CLI diagnostics. */
+export function summarizeAgentSessionIssueFailure(cause: unknown): string {
+  const tags: string[] = [];
+  const seen = new Set<object>();
+  let value = cause;
+  let sqliteCode: number | undefined;
+  for (let depth = 0; depth < 10 && typeof value === "object" && value !== null; depth++) {
+    if (seen.has(value)) break;
+    seen.add(value);
+    if ("_tag" in value && typeof value._tag === "string" && sessionIssueErrorTags.has(value._tag))
+      tags.push(value._tag);
+    // Node uses errcode; Bun uses errno. Never print message, SQL, payload or stack.
+    const code = "errcode" in value ? value.errcode : "errno" in value ? value.errno : undefined;
+    if (
+      typeof code === "number" &&
+      Number.isInteger(code) &&
+      code > 0 &&
+      code <= 65535 &&
+      (code & 0xff) > 0 &&
+      (code & 0xff) <= 28
+    )
+      sqliteCode = code;
+    value = "cause" in value ? value.cause : undefined;
+  }
+  const details = [...tags, ...(sqliteCode === undefined ? [] : [`SQLITE(${sqliteCode})`])];
+  return details.length === 0 ? "" : ` [${details.join(" > ")}]`;
+}
+
+const isSessionTokenIssueError = Schema.is(EnvironmentAuth.ServerAuthSessionTokenIssueError);
+const isSessionCredentialIssueError = Schema.is(SessionCredentialIssueError);
+const isPersistenceSqlError = Schema.is(PersistenceSqlError);
+
+/** A busy, failed single-row INSERT is safe to retry. No other auth or HTTP work is. */
+export function isRetryableAgentSessionInsertFailure(cause: unknown): boolean {
+  if (!isSessionTokenIssueError(cause)) return false;
+  const credential = cause.cause;
+  if (!isSessionCredentialIssueError(credential)) return false;
+  const persistence = credential.cause;
+  if (
+    !isPersistenceSqlError(persistence) ||
+    persistence.operation !== "AuthSessionRepository.create:query"
+  )
+    return false;
+  const sql = persistence.cause;
+  if (
+    !isSqlError(sql) ||
+    (sql.reason.operation !== "execute" && sql.reason.operation !== "prepare")
+  )
+    return false;
+  const native = sql.reason.cause;
+  if (typeof native !== "object" || native === null) return false;
+  const code = "errcode" in native ? native.errcode : "errno" in native ? native.errno : undefined;
+  if (typeof code !== "number" || !Number.isInteger(code) || code <= 0 || code > 65535)
+    return false;
+  const isNativeSqlite =
+    ("code" in native && native.code === "ERR_SQLITE_ERROR") ||
+    ("name" in native && native.name === "SQLiteError");
+  return isNativeSqlite && ((code & 0xff) === 5 || (code & 0xff) === 6);
+}
+
 export const withAgentSession = <A, E, R>(
   auth: Pick<EnvironmentAuth.EnvironmentAuth["Service"], "issueSession" | "revokeSession">,
   operate: boolean,
   run: (token: string) => Effect.Effect<A, E, R>,
 ) =>
   Effect.acquireUseRelease(
-    auth
-      .issueSession({
+    Effect.suspend(() =>
+      auth.issueSession({
         ttl: Duration.minutes(2),
         label: "t3 agent cli",
         scopes: operate
           ? [AuthOrchestrationReadScope, AuthOrchestrationOperateScope]
           : [AuthOrchestrationReadScope],
-      })
-      .pipe(
-        Effect.mapError(
-          () => new AgentCliError({ message: "Could not issue a short-lived agent session." }),
-        ),
+      }),
+    ).pipe(
+      // Retry acquisition only. In particular, never repeat the run callback after dispatch.
+      Effect.retry({
+        times: 2,
+        while: isRetryableAgentSessionInsertFailure,
+        schedule: Schedule.spaced("200 millis").pipe(Schedule.jittered),
+      }),
+      Effect.mapError(
+        (cause) =>
+          new AgentCliError({
+            message: `Could not issue a short-lived agent session.${isRetryableAgentSessionInsertFailure(cause) ? " The auth database remained busy after 3 attempts." : ""}${summarizeAgentSessionIssueFailure(cause)}`,
+          }),
       ),
+    ),
     (issued) => run(issued.token),
     (issued) =>
       auth
