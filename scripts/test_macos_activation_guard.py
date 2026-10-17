@@ -89,6 +89,20 @@ class GuardTests(unittest.TestCase):
             with self.assertRaises(guard.Hold):
                 guard.admit(self.m)
 
+    def test_native_union_change_between_capture_observations_holds(self):
+        changed = {**self.native, "fingerprint": "loaded-union-changed"}
+        with patch.object(guard, "check_pins"), patch.object(guard, "native_snapshot", side_effect=[self.native, changed]):
+            with self.assertRaisesRegex(guard.Hold, "idle observations changed"):
+                guard.admit(self.m, capture=True)
+        self.assertFalse(pathlib.Path(self.m["baseline_file"]).exists())
+
+    def test_native_union_change_after_capture_holds_gate(self):
+        with self.safe():
+            guard.admit(self.m, capture=True)
+            self.native = {**self.native, "fingerprint": "loaded-union-changed"}
+            with self.assertRaisesRegex(guard.Hold, "native state changed"):
+                guard.admit(self.m)
+
     def test_process_change_and_shutdown_refuse_before_native_probe(self):
         for reason in ("exact process changed", "process shut down"):
             with patch.object(guard, "check_pins", side_effect=guard.Hold(reason)), patch.object(guard, "native_snapshot") as native:

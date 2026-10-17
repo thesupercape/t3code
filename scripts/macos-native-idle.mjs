@@ -21,7 +21,15 @@ export const sourceKinds = [
 ];
 
 export async function proveNativeIdle(rpc, bindings) {
-  const statuses = [];
+  const validId = (id) => typeof id === "string" && id.length > 0 && id.trim() === id;
+  const nextPage = (result, cursors) => {
+    const cursor = result.nextCursor ?? null;
+    if (cursor !== null && (typeof cursor !== "string" || !cursor || cursors.has(cursor)))
+      throw Error("native-pagination-uncertain");
+    if (cursor !== null) cursors.add(cursor);
+    if (cursors.size > 10000) throw Error("native-pagination-limit");
+    return cursor;
+  };
   const listed = new Map();
   for (const archived of [false, true]) {
     const cursors = new Set();
@@ -37,36 +45,63 @@ export async function proveNativeIdle(rpc, bindings) {
       });
       if (page.error || !Array.isArray(page.result?.data)) throw Error("native-list-unavailable");
       for (const thread of page.result.data) {
-        if (typeof thread.id !== "string" || !thread.id)
-          throw Error("native-list-identity-unknown");
-        if (listed.has(thread.id)) throw Error("native-list-duplicate");
+        if (!validId(thread?.id)) throw Error("native-list-identity-unknown");
         const type = thread.status?.type;
         if (!idleTypes.has(type)) {
           if (type === "active") return { idle: false, busy: true };
           throw Error("native-status-unknown");
         }
-        statuses.push([thread.id, type]);
+        // The same inactive root can appear in multiple pages/archive views.
+        // Conflicting observations still hold the gate.
+        if (listed.has(thread.id) && listed.get(thread.id) !== type)
+          throw Error("native-list-status-inconsistent");
         listed.set(thread.id, type);
       }
-      cursor = page.result.nextCursor ?? null;
-      if (cursor !== null && (typeof cursor !== "string" || !cursor || cursors.has(cursor)))
-        throw Error("native-pagination-uncertain");
-      if (cursor !== null) cursors.add(cursor);
-      if (cursors.size > 10000) throw Error("native-pagination-limit");
+      cursor = nextPage(page.result, cursors);
     } while (cursor !== null);
   }
-  const reads = [];
-  for (const { thread_id, native_id } of bindings) {
-    if (typeof thread_id !== "string" || typeof native_id !== "string" || !native_id)
+
+  // Ephemeral sub-agent sessions may have no persistent thread/list row.
+  // loaded/list is an independent, required inventory, not a fallback.
+  const loaded = new Set();
+  const cursors = new Set();
+  let cursor = null;
+  do {
+    const page = await rpc("thread/loaded/list", { cursor, limit: 100 });
+    if (page.error || !Array.isArray(page.result?.data))
+      throw Error("native-loaded-list-unavailable");
+    for (const id of page.result.data) {
+      if (!validId(id)) throw Error("native-loaded-identity-unknown");
+      loaded.add(id);
+    }
+    cursor = nextPage(page.result, cursors);
+  } while (cursor !== null);
+
+  if (!Array.isArray(bindings)) throw Error("native-mapping-unknown");
+  const toRead = new Set(loaded);
+  for (const binding of bindings) {
+    if (!validId(binding?.thread_id) || !validId(binding?.native_id))
       throw Error("native-mapping-unknown");
+    if (!listed.has(binding.native_id) && !loaded.has(binding.native_id))
+      throw Error("native-mapping-not-in-inventory");
+    toRead.add(binding.native_id);
+  }
+  const statuses = new Map(listed);
+  for (const native_id of toRead) {
     const read = await rpc("thread/read", { threadId: native_id, includeTurns: false });
     const thread = read.result?.thread;
     if (read.error || thread?.id !== native_id) throw Error("native-read-unavailable");
-    if (!idleTypes.has(thread.status?.type)) {
-      if (thread.status?.type === "active") return { idle: false, busy: true };
+    const type = thread.status?.type;
+    if (!idleTypes.has(type)) {
+      if (type === "active") return { idle: false, busy: true };
       throw Error("native-read-status-unknown");
     }
-    if (listed.get(native_id) !== thread.status.type) throw Error("native-list-read-inconsistent");
+    if (listed.has(native_id) && listed.get(native_id) !== type)
+      throw Error("native-list-read-inconsistent");
+    statuses.set(native_id, type);
+  }
+  const reads = [];
+  for (const { thread_id, native_id } of bindings) {
     const turns = await rpc("thread/turns/list", {
       threadId: native_id,
       limit: 1,
@@ -80,17 +115,19 @@ export async function proveNativeIdle(rpc, bindings) {
       if (turn.status === "inProgress") return { idle: false, busy: true };
       throw Error("native-latest-turn-unknown");
     }
-    if (typeof turn.id !== "string" || !turn.id) throw Error("native-turn-identity-unknown");
-    reads.push([thread_id, native_id, thread.status.type, turn.id, turn.status]);
+    if (!validId(turn.id)) throw Error("native-turn-identity-unknown");
+    reads.push([thread_id, native_id, statuses.get(native_id), turn.id, turn.status]);
   }
-  statuses.sort((a, b) => a[0].localeCompare(b[0]));
+  const inventory = [...statuses].map(([id, type]) => [id, type, listed.has(id), loaded.has(id)]);
+  inventory.sort((a, b) => a[0].localeCompare(b[0]));
+  reads.sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
   const fingerprint = NodeCrypto.createHash("sha256")
-    .update(JSON.stringify([statuses, reads]))
+    .update(JSON.stringify([inventory, reads]))
     .digest("hex");
   return {
     idle: true,
     bindings_checked: bindings.length,
-    threads_checked: statuses.length,
+    threads_checked: statuses.size,
     fingerprint,
   };
 }
