@@ -233,16 +233,10 @@ export function resolveFollowUpSubmission(input: {
   isConnecting: boolean;
   isThreadLoading: boolean;
   isEnvironmentUnavailable: boolean;
-}): "steer" | "queue" | "send" {
-  if (
-    input.phase === "running" &&
-    input.followUpBehavior === "steer" &&
-    input.hasThread &&
-    input.hasContent &&
-    !input.hasDirectAnnotation
-  ) {
-    return "steer";
-  }
+}): "queue" | "send" {
+  // Immediate delivery is resolved against provider state, including when
+  // the projected phase is stale or another follow-up is deliberately queued.
+  if (input.followUpBehavior === "steer") return "send";
   if (shouldQueueFollowUp(input)) return "queue";
   if (
     input.hasQueuedFollowUps &&

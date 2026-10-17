@@ -783,6 +783,11 @@ export function useThreadOutboxDrain(): void {
             attachments: prepared.attachments,
           },
           modelSelection: sendSettings.modelSelection,
+          ...(currentConfig.providers.find(
+            (provider) => provider.instanceId === sendSettings.modelSelection.instanceId,
+          )?.driver === "codex"
+            ? { deliveryMode: "immediate" as const }
+            : {}),
           runtimeMode: sendSettings.runtimeMode,
           interactionMode: sendSettings.interactionMode,
           createdAt: queuedMessage.createdAt,

@@ -115,16 +115,52 @@ in its resume cursor. New sessions use `thread/start`; continuation uses `thread
 explicit fork uses `thread/fork`. A failed resume remains an error. T3 does not create a replacement
 thread containing reconstructed conversation text.
 
-Steering carries `expectedTurnId` through the orchestration command and provider service to
-`turn/steer`. The service rejects a stale target rather than steering a later turn or queuing new
-work. Steering does not override model, sandbox, or approval settings. Normal submission and
-interruption use `turn/start` and `turn/interrupt`.
+For steering, `expectedTurnId` records the caller's observed turn, or is explicitly `null` when
+the caller has no reliable turn ID. Null is not a start request. Cached T3 session and latest-turn fields do not veto delivery. The
+[Codex runtime](../../apps/server/src/provider/Layers/CodexSessionRuntime.ts) reads the exact bound
+provider thread with `thread/read` and requires one `inProgress` turn. It sends `turn/steer` with
+that provider-authoritative turn ID, which can differ from the observation. An explicit provider
+turn-mismatch rejection permits one refresh and resend, only if the active turn changed. A
+transport failure or uncertain response never permits automatic replay. Missing or ambiguous
+active turns fail without starting or queuing a new turn. Steering does not override model,
+sandbox, or approval settings. Interruption still uses the exact active turn ID.
+
+Normal immediate client sends opt into `deliveryMode: "immediate"` on `thread.turn.start`.
+The Codex runtime reads the bound provider thread, steers its active parent, or starts exactly
+one turn after a validated idle result. An uncertain read or send does not authorize a fallback
+start or automatic replay. Omitting the field preserves ordinary start/queue behavior; other
+providers retain their existing send path. Explicit steering never falls back to start.
+
+An orchestration receipt acknowledges command acceptance, not provider delivery. The reactor
+records `provider.turn.steer.accepted` only after the provider acknowledges the resolved turn. Its
+payload retains the command and message IDs, observed `expectedTurnId`, and actual
+`providerTurnId`. `provider.turn.steer.failed` means delivery was not confirmed, not necessarily
+that the provider received nothing. Inspect that outcome before taking another action; it does
+not authorize a new-turn fallback or replay of an uncertain send.
+
+Immediate sends use `provider.turn.immediate.accepted` or `.failed` with the same command and
+message IDs. Acceptance includes the actual `providerTurnId` and `delivery` of `start` or
+`steer`. Clients and Deck must not promote a persisted user message or orchestration acceptance
+to provider delivery. Deck reconciles these keyed receipts and retains an uncertain send
+without dispatching it again.
+
+A shared Codex connection can deliver notifications for other chats. The runtime accepts parent
+lifecycle updates only for its known, exact provider root thread. A foreign thread becomes a
+child only through an explicit spawn relationship to that root or a registered descendant, or
+an owned collaboration receiver relationship. An unknown foreign ID alone is not ownership.
+Child lifecycle and content use the existing child activity path, not the parent's latest turn,
+status, or chat messages. Early unregistered foreign content is dropped rather than attributed
+to the parent. Provisional child live-turn tracking does not authorize interruption until an
+owned relationship is established.
 
 The provider event log retains native notifications as `codex/rawNotification`, including fields
 the current normalizer does not recognize. This logging path records notifications, not outgoing
 requests or authentication responses. Canonical events retain provider thread, turn, item, and
-child identities where supplied. The client folds child events into bounded activity and result
-previews; Codex remains authoritative for full child conversation history.
+child identities where supplied. Normalized child events retain the parent thread and its
+registration-time spawn turn, when known, alongside the child and immediate-parent identities.
+Later activity does not rebind an existing child to a new parent turn. The client
+folds child events into bounded activity and result previews; Codex remains authoritative for
+full child conversation history.
 
 File-change approval previews use the matching session, provider thread, turn, and item. A preview
 is consumed once and has explicit size bounds. The protocol reader handles approval requests

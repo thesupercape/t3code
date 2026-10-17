@@ -54,7 +54,7 @@ export function SteerTurnDialog(props: {
 
   return (
     <>
-      {state.activeTurnId !== null ? (
+      {state.canSteer ? (
         <View className="items-end">
           <ComposerInlineControl
             label="Steer active turn"
@@ -101,11 +101,7 @@ export function SteerTurnDialog(props: {
                 placeholder="Instruction for this turn"
                 className="min-h-32 max-h-64 rounded-xl"
               />
-              {!state.targetIsRunning ? (
-                <Text accessibilityLiveRegion="polite" className="text-sm text-foreground-muted">
-                  This turn is no longer running. Close and reopen to choose another turn.
-                </Text>
-              ) : props.disabled ? (
+              {props.disabled ? (
                 <Text accessibilityLiveRegion="polite" className="text-sm text-foreground-muted">
                   Reconnect to the environment or finish the current edit before steering.
                 </Text>

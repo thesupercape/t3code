@@ -144,6 +144,6 @@ describe("ComposerPrimaryActions", () => {
   });
 
   it("labels a running text send as steering when configured", () => {
-    expect(renderRunningActions(true, "steer")).toContain('aria-label="Steer current turn"');
+    expect(renderRunningActions(true, "steer")).toContain('aria-label="Send message now"');
   });
 });

@@ -17,6 +17,7 @@ const script = JSON.parse(NodeFS.readFileSync(process.env.T3_CODEX_COLLAB_SCRIPT
 
 const write = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
 let turnStartCount = 0;
+let threadReadCount = 0;
 
 const rl = NodeReadline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -27,6 +28,12 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method } = message;
+  if (script.recordDeliveryCalls && ["thread/read", "turn/steer", "turn/start"].includes(method)) {
+    NodeFS.appendFileSync(
+      `${process.env.T3_CODEX_COLLAB_SCRIPT}.delivery`,
+      `${JSON.stringify(message)}\n`,
+    );
+  }
   if (id !== undefined && method === undefined) {
     write({ method: "probe/response", params: message });
     return;
@@ -44,6 +51,32 @@ rl.on("line", (line) => {
     write({ method: "probe/steer", params: message.params });
     return;
   }
+  if (method === "thread/read") {
+    const scripted = script.threadReadResponses?.[threadReadCount++];
+    if (scripted) {
+      write({ id, result: scripted });
+      return;
+    }
+    write({
+      id,
+      result: {
+        thread: {
+          ...fixture.responses.threadStart.thread,
+          id: script.rootThreadId,
+          turns: script.expectedActiveTurnId
+            ? [
+                {
+                  ...fixture.responses.turnStart.turn,
+                  id: script.expectedActiveTurnId,
+                  status: "inProgress",
+                },
+              ]
+            : [],
+        },
+      },
+    });
+    return;
+  }
   if (method === "initialize") {
     write({
       id,
@@ -57,7 +90,13 @@ rl.on("line", (line) => {
     return;
   }
   if (method === "thread/start" || method === "thread/resume") {
-    write({ id, result: fixture.responses.threadStart });
+    write({
+      id,
+      result: {
+        ...fixture.responses.threadStart,
+        thread: { ...fixture.responses.threadStart.thread, id: script.rootThreadId },
+      },
+    });
     return;
   }
   if (method === "turn/start") {

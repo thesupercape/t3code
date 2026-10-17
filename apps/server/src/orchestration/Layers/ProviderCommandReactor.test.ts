@@ -153,6 +153,7 @@ describe("ProviderCommandReactor", () => {
     readonly seedInterruptedCompaction?: "active" | "attempted";
     readonly compactThreadEffect?: NonNullable<ProviderServiceShape["compactThread"]>;
     readonly sendTurnEffect?: ProviderServiceShape["sendTurn"];
+    readonly steerCausationEventId?: EventId | null;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -395,7 +396,14 @@ describe("ProviderCommandReactor", () => {
             return engine.dispatch(command);
           },
           get streamDomainEvents() {
-            return engine.streamDomainEvents;
+            return engine.streamDomainEvents.pipe(
+              Stream.map((event) =>
+                event.type === "thread.turn-steer-requested" &&
+                input?.steerCausationEventId !== undefined
+                  ? { ...event, causationEventId: input.steerCausationEventId }
+                  : event,
+              ),
+            );
           },
           subscribeDomainEvents: engine.subscribeDomainEvents,
           latestSequence: engine.latestSequence,
@@ -591,6 +599,8 @@ describe("ProviderCommandReactor", () => {
     return {
       engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
+      readThreadPage: (threadId: ThreadId) =>
+        Effect.runPromise(snapshotQuery.getThreadDetailSnapshot(threadId, { turnLimit: 1 })),
       readCompactions: () => Effect.runPromise(snapshotQuery.getActiveContextCompactions()),
       startSession,
       sendTurn,
@@ -1018,72 +1028,369 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
   });
 
-  it.each(["codex-turn-1", "new-provider-turn"])(
-    "steers only the exact active Codex turn, runtime turn %s",
-    async (runtimeTurnId) => {
-      const harness = await createHarness();
-      const threadId = ThreadId.make("thread-1");
-      const expectedTurnId = asTurnId("codex-turn-1");
-      const now = "2026-01-01T00:00:00.000Z";
-      harness.runtimeSessions.push({
-        provider: ProviderDriverKind.make("codex"),
-        threadId,
-        status: "running",
-        runtimeMode: "approval-required",
-        activeTurnId: asTurnId(runtimeTurnId),
-        createdAt: now,
-        updatedAt: now,
-      });
-      await Effect.runPromise(
-        harness.engine.dispatch({
+  effectIt.effect.each(["starting", "ready"] as const)(
+    "delivers immediate sends with %s/null projection without restarting the bound runtime",
+    (status) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            sendTurnEffect: (input) =>
+              Effect.succeed({
+                threadId: input.threadId,
+                turnId: asTurnId("actual-parent-turn"),
+                delivery: "steer",
+              }),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const now = "2026-01-01T00:00:00.000Z";
+        harness.runtimeSessions.push({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          status: "ready",
+          runtimeMode: "full-access",
+          createdAt: now,
+          updatedAt: now,
+        });
+        yield* harness.engine.dispatch({
           type: "thread.session.set",
-          commandId: CommandId.make("cmd-steer-session"),
+          commandId: CommandId.make("cmd-immediate-stale-session"),
+          threadId,
+          session: {
+            threadId,
+            status,
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
+        const command = {
+          type: "thread.turn.start",
+          deliveryMode: "immediate",
+          commandId: CommandId.make("cmd-immediate-send"),
+          threadId,
+          message: {
+            messageId: asMessageId("immediate-message"),
+            role: "user",
+            text: "  Keep  exact spacing.\nContinue now.  ",
+            attachments: [],
+          },
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex"),
+            model: "must-not-change",
+          },
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        } as const;
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.startSession).not.toHaveBeenCalled();
+        expect(harness.sendTurn).toHaveBeenCalledExactlyOnceWith({
+          threadId,
+          deliveryMode: "immediate",
+          input: command.message.text,
+          interactionMode: "default",
+          attachments: [],
+        });
+        const state = yield* Effect.promise(() => harness.readModel());
+        expect(state.threads[0]?.session).toMatchObject({
+          status: "running",
+          runtimeMode: "full-access",
+          activeTurnId: "actual-parent-turn",
+        });
+        expect(
+          state.threads[0]?.activities.find(
+            (activity) => activity.kind === "provider.turn.immediate.accepted",
+          ),
+        ).toMatchObject({
+          turnId: "actual-parent-turn",
+          payload: {
+            commandId: command.commandId,
+            messageId: command.message.messageId,
+            providerTurnId: "actual-parent-turn",
+            delivery: "steer",
+            deliveryStatus: "provider-accepted",
+          },
+        });
+      }),
+  );
+
+  effectIt.effect(
+    "reports uncertain immediate delivery without a new-turn fallback or erasing the running session",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            sendTurnEffect: () =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: "codex",
+                  method: "turn/steer",
+                  detail: "connection lost after send",
+                }),
+              ),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const now = "2026-01-01T00:00:00.000Z";
+        harness.runtimeSessions.push({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          status: "running",
+          runtimeMode: "full-access",
+          activeTurnId: asTurnId("real-turn"),
+          createdAt: now,
+          updatedAt: now,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-immediate-running-session"),
           threadId,
           session: {
             threadId,
             status: "running",
             providerName: "codex",
-            runtimeMode: "approval-required",
-            activeTurnId: expectedTurnId,
+            runtimeMode: "full-access",
+            activeTurnId: asTurnId("real-turn"),
             lastError: null,
             updatedAt: now,
           },
           createdAt: now,
-        }),
-      );
-      await Effect.runPromise(
-        harness.engine.dispatch({
+        });
+        const command = {
+          type: "thread.turn.start",
+          deliveryMode: "immediate",
+          commandId: CommandId.make("cmd-immediate-failure"),
+          threadId,
+          message: {
+            messageId: asMessageId("uncertain-message"),
+            role: "user",
+            text: "continue",
+            attachments: [],
+          },
+          interactionMode: "default",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        } as const;
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        expect(harness.startSession).not.toHaveBeenCalled();
+        const state = yield* Effect.promise(() => harness.readModel());
+        expect(state.threads[0]?.session).toMatchObject({
+          status: "running",
+          runtimeMode: "full-access",
+          activeTurnId: "real-turn",
+          lastError: null,
+        });
+        expect(
+          state.threads[0]?.activities.filter(
+            (activity) => activity.kind === "provider.turn.immediate.failed",
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              commandId: command.commandId,
+              messageId: command.message.messageId,
+              deliveryStatus: "not-confirmed",
+              unconfirmedDeliveryWillRetry: false,
+            }),
+          }),
+        ]);
+      }),
+  );
+
+  effectIt.effect.each(["codex-turn-1", "new-provider-turn"])(
+    "records provider-authoritative steering despite stale projection, provider turn %s",
+    (runtimeTurnId) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            sendTurnEffect: (input) =>
+              Effect.succeed({ threadId: input.threadId, turnId: asTurnId(runtimeTurnId) }),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const expectedTurnId =
+          runtimeTurnId === "new-provider-turn" ? null : asTurnId("nonexistent-child-turn");
+        const now = "2026-01-01T00:00:00.000Z";
+        harness.runtimeSessions.push({
+          provider: ProviderDriverKind.make("codex"),
+          threadId,
+          status: "running",
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId(runtimeTurnId),
+          createdAt: now,
+          updatedAt: now,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-steer-session"),
+          threadId,
+          session: {
+            threadId,
+            status: "starting",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.message.assistant.delta",
+          commandId: CommandId.make("cmd-steer-parent-message"),
+          threadId,
+          messageId: asMessageId("parent-message"),
+          turnId: asTurnId(runtimeTurnId),
+          delta: "Parent task is running.",
+          createdAt: now,
+        });
+        const command = {
           type: "thread.turn.steer",
           commandId: CommandId.make("cmd-steer"),
           threadId,
           expectedTurnId,
           messageId: asMessageId("steering-message"),
-          text: "Check the target tab.",
+          text: "Check the target tab.\nKeep  the original wording.",
           createdAt: now,
-        }),
-      );
-      await harness.drain();
-      expect(harness.startSession).not.toHaveBeenCalled();
-      if (runtimeTurnId === expectedTurnId) {
+        } as const;
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.startSession).not.toHaveBeenCalled();
         expect(harness.sendTurn).toHaveBeenCalledExactlyOnceWith({
           threadId,
           expectedTurnId,
-          input: "Check the target tab.",
+          input: command.text,
         });
-      } else {
-        expect(harness.sendTurn).not.toHaveBeenCalled();
-        const state = await harness.readModel();
+        const state = yield* Effect.promise(() => harness.readModel());
         expect(
-          state.threads[0]?.activities.some(
-            (activity) => activity.kind === "provider.turn.steer.failed",
+          state.threads[0]?.activities.find(
+            (activity) => activity.kind === "provider.turn.steer.accepted",
           ),
-        ).toBe(true);
-      }
-      const state = await harness.readModel();
-      expect(
-        state.threads[0]?.messages.find((message) => message.id === "steering-message")?.turnId,
-      ).toBe(expectedTurnId);
-    },
+        ).toMatchObject({
+          turnId: runtimeTurnId,
+          payload: {
+            commandId: "cmd-steer",
+            messageId: "steering-message",
+            expectedTurnId,
+            providerTurnId: runtimeTurnId,
+            deliveryStatus: "provider-accepted",
+          },
+        });
+        expect(
+          state.threads[0]?.messages.find((message) => message.id === "steering-message")?.turnId,
+        ).toBeNull();
+        // Reload uses the windowed projection query. A user message linked to
+        // the nonexistent expected child would be silently excluded here.
+        const reloadedPage = yield* Effect.promise(() => harness.readThreadPage(threadId));
+        expect(reloadedPage._tag).toBe("Some");
+        if (reloadedPage._tag === "Some") {
+          expect(reloadedPage.value.page).toBeDefined();
+          expect(
+            reloadedPage.value.thread.messages.filter(
+              (message) => message.id === command.messageId,
+            ),
+          ).toEqual([expect.objectContaining({ role: "user", text: command.text, turnId: null })]);
+        }
+      }),
+  );
+
+  effectIt.effect.each(["turn completed before delivery", "connection lost after send"])(
+    "retains a keyed unconfirmed steering receipt without replay: %s",
+    (detail) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            sendTurnEffect: () =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: "codex",
+                  method: "turn/steer",
+                  detail,
+                }),
+              ),
+          }),
+        );
+        const command = {
+          type: "thread.turn.steer",
+          commandId: CommandId.make("cmd-steer-failure"),
+          threadId: ThreadId.make("thread-1"),
+          expectedTurnId: asTurnId("stale-observed-turn"),
+          messageId: asMessageId("failed-steering-message"),
+          text: "Keep the original parent task moving.",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        } as const;
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        yield* harness.engine.dispatch(command);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        expect(harness.startSession).not.toHaveBeenCalled();
+        const state = yield* Effect.promise(() => harness.readModel());
+        const activities = state.threads[0]?.activities ?? [];
+        expect(
+          activities.filter((activity) => activity.kind === "provider.turn.steer.failed"),
+        ).toHaveLength(1);
+        expect(
+          activities.find((activity) => activity.kind === "provider.turn.steer.failed"),
+        ).toMatchObject({
+          turnId: command.expectedTurnId,
+          payload: {
+            commandId: command.commandId,
+            messageId: command.messageId,
+            expectedTurnId: command.expectedTurnId,
+            deliveryStatus: "not-confirmed",
+            unconfirmedDeliveryWillRetry: false,
+          },
+        });
+        expect(
+          activities.some((activity) => activity.kind === "provider.turn.steer.accepted"),
+        ).toBe(false);
+        expect(
+          state.threads[0]?.messages.find((message) => message.id === command.messageId)?.turnId,
+        ).toBeNull();
+      }),
+  );
+
+  effectIt.effect.each([null, EventId.make("unrelated-user-message-event")])(
+    "does not send steering without its persisted user-message causation: %s",
+    (steerCausationEventId) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness({ steerCausationEventId }));
+        yield* harness.engine.dispatch({
+          type: "thread.turn.steer",
+          commandId: CommandId.make("cmd-steer-invalid-causation"),
+          threadId: ThreadId.make("thread-1"),
+          expectedTurnId: asTurnId("nonexistent-child-turn"),
+          messageId: asMessageId("unbound-steering-message"),
+          text: "Do not send without the matching receipt.",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        });
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+        expect(harness.startSession).not.toHaveBeenCalled();
+        const state = yield* Effect.promise(() => harness.readModel());
+        expect(state.threads[0]?.activities).toEqual([
+          expect.objectContaining({
+            kind: "provider.turn.steer.failed",
+            payload: expect.objectContaining({
+              detail: "The steering request does not match its persisted user message.",
+            }),
+          }),
+        ]);
+      }),
   );
 
   effectIt.effect("projects starting before a slow provider session finishes", () =>

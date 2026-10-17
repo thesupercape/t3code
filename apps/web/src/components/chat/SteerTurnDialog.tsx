@@ -22,11 +22,13 @@ export function SteerTurnDialog({
   environmentId,
   threadId,
   activeTurnId,
+  canSteer,
   disabled,
 }: {
   environmentId: EnvironmentId;
   threadId: ThreadId;
   activeTurnId: TurnId | null;
+  canSteer: boolean;
   disabled: boolean;
 }) {
   const steerTurn = useAtomCommand(threadEnvironment.steerTurn, { reportFailure: false });
@@ -35,10 +37,9 @@ export function SteerTurnDialog({
   const [text, setText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const targetIsRunning = targetTurnId !== null && targetTurnId === activeTurnId;
 
   const submit = async () => {
-    if (!targetIsRunning || !targetTurnId || !text.trim() || submitting || disabled) return;
+    if (!canSteer || !text.trim() || submitting || disabled) return;
     setSubmitting(true);
     setError(null);
     const result = await steerTurn({
@@ -66,7 +67,7 @@ export function SteerTurnDialog({
         setOpen(nextOpen);
       }}
     >
-      {activeTurnId !== null ? (
+      {canSteer ? (
         <div className="mx-auto flex w-full max-w-3xl justify-end pb-1">
           <DialogTrigger render={<Button size="sm" variant="ghost" disabled={disabled} />}>
             Steer active turn
@@ -88,11 +89,6 @@ export function SteerTurnDialog({
             onChange={(event) => setText(event.currentTarget.value)}
             disabled={submitting}
           />
-          {!targetIsRunning ? (
-            <p role="status" className="text-sm text-muted-foreground">
-              This turn has ended. Close this dialog to choose another turn.
-            </p>
-          ) : null}
           {error ? (
             <p role="alert" className="text-sm text-destructive-foreground">
               {error}
@@ -103,7 +99,7 @@ export function SteerTurnDialog({
           <DialogClose render={<Button variant="outline" />}>Cancel</DialogClose>
           <Button
             onClick={() => void submit()}
-            disabled={!targetIsRunning || !text.trim() || submitting || disabled}
+            disabled={!canSteer || !text.trim() || submitting || disabled}
           >
             {submitting ? "Submitting…" : "Send instruction"}
           </Button>

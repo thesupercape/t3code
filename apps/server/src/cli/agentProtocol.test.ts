@@ -133,6 +133,73 @@ describe("agent action boundary", () => {
       ),
     ).toThrow();
   });
+  it.each([undefined, "immediate"] as const)(
+    "admits start (%s) despite stale running projection so provider can resolve delivery",
+    (deliveryMode) => {
+      const action = decodeAgentAction(
+        envelope({
+          type: "thread.turn.start",
+          commandId: "start-stale",
+          threadId: "thread-a",
+          ...(deliveryMode !== undefined ? { deliveryMode } : {}),
+          message: {
+            messageId: "next-message",
+            role: "user",
+            text: "Continue now",
+            attachments: [],
+          },
+          runtimeMode: thread.runtimeMode,
+          interactionMode: "default",
+          createdAt: now,
+        }),
+      );
+      expect(() => validateAgentAction(action, identity, shell, detail)).not.toThrow();
+    },
+  );
+
+  it.each(["stale-child", "completed", "missing-session"])(
+    "defers steering to the provider when projection state is %s",
+    (state) => {
+      const observed = decodeDetail({
+        ...detail,
+        thread: {
+          ...thread,
+          latestTurn: { ...thread.latestTurn, turnId: "child-turn", state: "completed" },
+          session:
+            state === "missing-session"
+              ? null
+              : {
+                  ...thread.session,
+                  status: state === "completed" ? "ready" : "running",
+                  activeTurnId: state === "completed" ? null : "old-session-turn",
+                },
+        },
+      });
+      const action = decodeAgentAction(
+        envelope({
+          type: "thread.turn.steer",
+          commandId: "steer-a",
+          threadId: "thread-a",
+          expectedTurnId: "observed-parent-turn",
+          messageId: "message-a",
+          text: "Keep working on the parent task.",
+          createdAt: now,
+        }),
+      );
+      expect(() => validateAgentAction(action, identity, shell, observed)).not.toThrow();
+      expect(() =>
+        validateAgentAction(
+          action,
+          identity,
+          shell,
+          decodeDetail({
+            ...observed,
+            thread: { ...observed.thread, id: "thread-b" },
+          }),
+        ),
+      ).toThrow("Thread must be read from this environment");
+    },
+  );
   it("allows only bare loopback origins, never credential-bearing or redirected URLs", () => {
     expect(validateAgentOrigin("http://127.0.0.1:8282")).toBe("http://127.0.0.1:8282");
     for (const url of [

@@ -32,6 +32,18 @@ Actions recheck the observed environment and runtime before dispatch. This is a
 local preflight check, not an atomic server-side concurrency guard. State may
 change after observation; retain exact turn and request IDs when acting.
 
+For Codex steering, `expectedTurnId` is the observed turn or explicit `null` when
+unknown, not a lock on cached T3 state. The provider resolves the active turn on the thread's existing bound
+Codex thread at delivery time. A stale or child-contaminated snapshot therefore
+does not prevent steering the active parent turn. Interruption still requires
+the exact active turn ID. Neither action starts a replacement turn.
+
+For immediate delivery, `thread.turn.start` accepts optional `deliveryMode: "immediate"`.
+Codex reads its actual bound thread and either steers its active parent or starts
+one turn after verifying idle. Omitting the field preserves ordinary start/queue
+behavior. Explicit steering never becomes a start request, including with a null
+turn ID.
+
 Inspection uses a short-lived orchestration-read session. Actions also require
 orchestration-operate. These scopes cover the environment, not a single thread.
 The CLI retains the credential in memory and revokes its session on normal
@@ -114,6 +126,21 @@ server receipt; `rejected` means the server refused dispatch; `unknown` means
 delivery could not be confirmed. A failed or oversized readback does not discard
 an accepted receipt. The CLI performs one readback; it does not wait for provider
 completion.
+
+For `thread.turn.steer`, look for `provider.turn.steer.accepted` with the same
+command and message IDs. It records the observed `expectedTurnId` and resolved
+`providerTurnId`, and confirms provider acceptance, not completion of the
+requested work. `provider.turn.steer.failed` reports unconfirmed delivery. It
+does not prove the provider received nothing. The runtime may refresh and
+resend once after an explicit pre-delivery turn-mismatch rejection, but never
+after an uncertain send. Do not replay an unconfirmed message or submit it as a
+new turn automatically.
+
+Immediate sends report `provider.turn.immediate.accepted` or
+`provider.turn.immediate.failed`, keyed by both command and message ID. Acceptance
+includes `delivery` (`start` or `steer`) and the actual `providerTurnId`. A persisted
+user message alone is not delivery evidence. Deck keeps that case pending/unknown
+and checks the keyed provider receipt without resending the message.
 
 If delivery or readback fails, inspect current state before taking another
 action. The CLI does not replay mutations automatically. Never reuse a

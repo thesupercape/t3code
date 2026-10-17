@@ -247,7 +247,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
                   ? "Sending"
                   : isRunning
                     ? followUpBehavior === "steer"
-                      ? "Steer current turn"
+                      ? "Send message now"
                       : "Queue message"
                     : "Send message"
       }

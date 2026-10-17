@@ -314,14 +314,127 @@ describe("CodexSessionRuntime collab integration", () => {
           expectedTurnId: turnId,
           input: [{ type: "text", text: "focus on tests" }],
         });
-        const error = yield* runtime
-          .sendTurn({ expectedTurnId: TurnId.make("stale-turn"), input: "must fail" })
-          .pipe(Effect.flip);
-        assert.include(error.message, "active turn mismatch");
+        const recovered = yield* runtime.sendTurn({
+          expectedTurnId: TurnId.make("stale-projected-turn"),
+          input: "Still steer the actual parent turn.",
+        });
+        assert.equal(recovered.turnId, turnId);
         assert.equal((yield* runtime.getSession).activeTurnId, turnId);
         yield* runtime.close;
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  for (const delivery of ["null-steer", "immediate"] as const) {
+    it.effect(`resolves ${delivery} from a ready session with no cached active turn`, () =>
+      Effect.gen(function* () {
+        NodeFS.writeFileSync(
+          scriptPath,
+          encodeScript({
+            rootThreadId: ROOT,
+            expectedActiveTurnId: "actual-parent-turn",
+            notifications: [],
+            recordDeliveryCalls: true,
+          }),
+        );
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            NodeFS.rmSync(scriptPath, { force: true });
+            NodeFS.rmSync(`${scriptPath}.delivery`, { force: true });
+          }),
+        );
+        const runtime = yield* makeCodexSessionRuntime({
+          threadId: ThreadId.make("ready-parent"),
+          binaryPath: yield* peerPath,
+          cwd: NodeOS.tmpdir(),
+          runtimeMode: "full-access",
+          environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+        });
+        yield* runtime.start();
+        assert.equal((yield* runtime.getSession).status, "ready");
+        assert.isUndefined((yield* runtime.getSession).activeTurnId);
+        const text = "  Keep  exact wording.\nContinue now.  ";
+        const result = yield* runtime.sendTurn({
+          ...(delivery === "null-steer"
+            ? { expectedTurnId: null }
+            : { deliveryMode: "immediate" as const }),
+          input: text,
+          model: "must-not-switch-model",
+        });
+        assert.equal(result.turnId, "actual-parent-turn");
+        assert.equal(result.delivery, delivery === "immediate" ? "steer" : undefined);
+        const calls = NodeFS.readFileSync(`${scriptPath}.delivery`, "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        assert.deepEqual(
+          calls.map((call) => call.method),
+          ["thread/read", "turn/steer"],
+        );
+        assert.deepEqual(calls[1].params, {
+          threadId: ROOT,
+          expectedTurnId: "actual-parent-turn",
+          input: [{ type: "text", text }],
+        });
+        assert.notEqual((yield* runtime.getSession).model, "must-not-switch-model");
+        yield* runtime.close;
+      }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+
+  for (const deliveryMode of [undefined, "immediate"] as const) {
+    it.effect(
+      `starts once after provider completion despite stale running cache (${deliveryMode ?? "ordinary start"})`,
+      () =>
+        Effect.gen(function* () {
+          NodeFS.writeFileSync(
+            scriptPath,
+            encodeScript({
+              rootThreadId: ROOT,
+              turnIds: ["old-turn", "next-turn"],
+              holdTurnOpen: true,
+              onlyFirstTurnStarts: true,
+              notifications: [],
+              recordDeliveryCalls: true,
+              threadReadResponses: [
+                { thread: { id: ROOT, turns: [] } },
+                { thread: { id: ROOT, turns: [{ id: "old-turn", status: "completed" }] } },
+              ],
+            }),
+          );
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              NodeFS.rmSync(scriptPath, { force: true });
+              NodeFS.rmSync(`${scriptPath}.delivery`, { force: true });
+            }),
+          );
+          const runtime = yield* makeCodexSessionRuntime({
+            threadId: ThreadId.make("stale-running-parent"),
+            binaryPath: yield* peerPath,
+            cwd: NodeOS.tmpdir(),
+            runtimeMode: "full-access",
+            environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+          });
+          yield* runtime.start();
+          yield* runtime.sendTurn({ input: "first turn" });
+          assert.equal((yield* runtime.getSession).activeTurnId, "old-turn");
+          const result = yield* runtime.sendTurn({
+            ...(deliveryMode !== undefined ? { deliveryMode } : {}),
+            input: "next message",
+          });
+          assert.equal(result.turnId, "next-turn");
+          assert.equal((yield* runtime.getSession).activeTurnId, "next-turn");
+          const calls = NodeFS.readFileSync(`${scriptPath}.delivery`, "utf8")
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line));
+          assert.deepEqual(
+            calls.map((call) => call.method),
+            ["thread/read", "turn/start", "thread/read", "turn/start"],
+          );
+          yield* runtime.close;
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
 
   for (const mode of ["preview", "chrome", "desktop"] as const) {
     it.effect(`requires explicit permissions and MCP decisions in ${mode} mode`, () =>
@@ -628,9 +741,9 @@ describe("CodexSessionRuntime collab integration", () => {
         "pre-registration child A must still receive the interrupt RPC",
       );
       assert.isTrue(interruptedThreads.has(CHILD_B), "registered child B must be interrupted");
-      assert.isTrue(
+      assert.isFalse(
         interruptedThreads.has(MEMORY),
-        "memory consolidation must be interrupted without appearing in chat",
+        "memory consolidation has no parent relationship and must not be interrupted",
       );
       assert.isTrue(interruptedThreads.has(ROOT), "parent turn must be interrupted last");
 

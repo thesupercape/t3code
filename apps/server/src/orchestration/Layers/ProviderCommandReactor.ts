@@ -23,6 +23,7 @@ import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Equal from "effect/Equal";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -71,8 +72,7 @@ type ProviderIntentEvent = Extract<
 >;
 
 function toNonEmptyProviderInput(value: string | undefined): string | undefined {
-  const normalized = value?.trim();
-  return normalized && normalized.length > 0 ? normalized : undefined;
+  return value !== undefined && value.trim().length > 0 ? value : undefined;
 }
 
 function mapProviderSessionStatusToOrchestrationStatus(
@@ -358,6 +358,7 @@ const make = Effect.gen(function* () {
     readonly kind:
       | "provider.turn.start.failed"
       | "provider.turn.steer.failed"
+      | "provider.turn.immediate.failed"
       | "provider.turn.interrupt.failed"
       | "provider.approval.respond.failed"
       | "provider.user-input.respond.failed"
@@ -367,6 +368,7 @@ const make = Effect.gen(function* () {
     readonly turnId: TurnId | null;
     readonly createdAt: string;
     readonly requestId?: string;
+    readonly metadata?: Readonly<Record<string, unknown>>;
   }) =>
     Effect.all({
       commandId: serverCommandId("provider-failure-activity"),
@@ -385,6 +387,7 @@ const make = Effect.gen(function* () {
             payload: {
               detail: input.detail,
               ...(input.requestId ? { requestId: input.requestId } : {}),
+              ...input.metadata,
             },
             turnId: input.turnId,
             createdAt: input.createdAt,
@@ -580,6 +583,7 @@ const make = Effect.gen(function* () {
   const setThreadSession = (input: {
     readonly threadId: ThreadId;
     readonly session: OrchestrationSession;
+    readonly preservePendingTurnStart?: boolean;
     readonly createdAt: string;
   }) =>
     serverCommandId("provider-session-set").pipe(
@@ -589,6 +593,9 @@ const make = Effect.gen(function* () {
           commandId,
           threadId: input.threadId,
           session: input.session,
+          ...(input.preservePendingTurnStart !== undefined
+            ? { preservePendingTurnStart: input.preservePendingTurnStart }
+            : {}),
           createdAt: input.createdAt,
         }),
       ),
@@ -1595,6 +1602,97 @@ const make = Effect.gen(function* () {
       }
     }
 
+    const immediateSession =
+      event.payload.deliveryMode === "immediate"
+        ? (yield* providerService.listSessions()).find((session) => session.threadId === thread.id)
+        : undefined;
+    const immediateProvider =
+      event.payload.deliveryMode === "immediate"
+        ? (immediateSession?.provider ??
+          (yield* providerService.getInstanceInfo(thread.modelSelection.instanceId)).driverKind)
+        : undefined;
+    if (event.payload.deliveryMode === "immediate" && immediateProvider === "codex") {
+      const result = yield* Effect.gen(function* () {
+        // Reusing a bound runtime must not restart it or change its model,
+        // approval mode or sub-agent backend before the provider read.
+        if (immediateSession === undefined) {
+          yield* ensureSessionForThread(thread.id, event.payload.createdAt, {
+            ...(event.payload.modelSelection !== undefined
+              ? { modelSelection: event.payload.modelSelection }
+              : {}),
+            ...(event.payload.subagentBackend !== undefined
+              ? { subagentBackend: event.payload.subagentBackend }
+              : {}),
+            pendingTurnStart: true,
+          });
+        }
+        return yield* providerService.sendTurn({
+          threadId: thread.id,
+          deliveryMode: "immediate",
+          interactionMode: event.payload.interactionMode,
+          ...(message.text.length > 0 ? { input: message.text } : {}),
+          ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
+        });
+      }).pipe(Effect.exit);
+      if (Exit.isFailure(result)) {
+        if (Cause.hasInterruptsOnly(result.cause)) return yield* Effect.failCause(result.cause);
+        return yield* appendProviderFailureActivity({
+          threadId: thread.id,
+          kind: "provider.turn.immediate.failed",
+          summary: "Immediate message delivery was not confirmed",
+          detail: `${formatFailureDetail(result.cause)} Unconfirmed delivery is not replayed automatically.`,
+          turnId: null,
+          createdAt: event.payload.createdAt,
+          metadata: {
+            commandId: event.commandId,
+            messageId: event.payload.messageId,
+            deliveryStatus: "not-confirmed",
+            unconfirmedDeliveryWillRetry: false,
+          },
+        });
+      }
+      if (result.value.delivery === "steer") {
+        yield* setThreadSession({
+          preservePendingTurnStart: true,
+          threadId: thread.id,
+          session: {
+            threadId: thread.id,
+            status: "running",
+            providerName: "codex",
+            providerInstanceId:
+              immediateSession?.providerInstanceId ?? thread.modelSelection.instanceId,
+            runtimeMode: immediateSession?.runtimeMode ?? thread.runtimeMode,
+            activeTurnId: result.value.turnId,
+            lastError: null,
+            updatedAt: event.payload.createdAt,
+          },
+          createdAt: event.payload.createdAt,
+        });
+      }
+      yield* orchestrationEngine.dispatch({
+        type: "thread.activity.append",
+        commandId: yield* serverCommandId("provider-immediate-accepted"),
+        threadId: thread.id,
+        activity: {
+          id: yield* serverEventId(),
+          tone: "info",
+          kind: "provider.turn.immediate.accepted",
+          summary: "Message accepted by provider",
+          payload: {
+            commandId: event.commandId,
+            messageId: event.payload.messageId,
+            providerTurnId: result.value.turnId,
+            delivery: result.value.delivery ?? "start",
+            deliveryStatus: "provider-accepted",
+          },
+          turnId: result.value.turnId,
+          createdAt: event.payload.createdAt,
+        },
+        createdAt: event.payload.createdAt,
+      });
+      return;
+    }
+
     const handleTurnStartFailure = (cause: Cause.Cause<unknown>) => {
       if (Cause.hasInterruptsOnly(cause)) {
         return Effect.void;
@@ -1662,47 +1760,96 @@ const make = Effect.gen(function* () {
       appendProviderFailureActivity({
         threadId: event.payload.threadId,
         kind: "provider.turn.steer.failed",
-        summary: "Steering was not delivered",
+        summary: "Steering was not confirmed",
         detail,
         turnId: event.payload.expectedTurnId,
         createdAt: event.payload.createdAt,
+        metadata: {
+          commandId: event.commandId,
+          messageId: event.payload.messageId,
+          expectedTurnId: event.payload.expectedTurnId,
+          deliveryStatus: "not-confirmed",
+          unconfirmedDeliveryWillRetry: false,
+        },
       });
     const thread = yield* resolveThread(event.payload.threadId);
+    const message = thread?.messages.find((entry) => entry.id === event.payload.messageId);
+    // The decider persists the causal user message immediately before the
+    // request. Validate that receipt, not the caller's untrusted turn hint.
+    const causalMessage = yield* orchestrationEngine
+      .readEvents(event.sequence - 2, 1)
+      .pipe(Stream.runHead);
     if (
-      thread?.session?.status !== "running" ||
-      thread.session.activeTurnId !== event.payload.expectedTurnId
+      !thread ||
+      !message ||
+      message.role !== "user" ||
+      message.turnId !== null ||
+      Option.isNone(causalMessage) ||
+      causalMessage.value.type !== "thread.message-sent" ||
+      causalMessage.value.eventId !== event.causationEventId ||
+      causalMessage.value.commandId !== event.commandId ||
+      causalMessage.value.payload.threadId !== event.payload.threadId ||
+      causalMessage.value.payload.messageId !== event.payload.messageId ||
+      causalMessage.value.payload.role !== "user" ||
+      causalMessage.value.payload.turnId !== null ||
+      causalMessage.value.payload.text !== message.text
     ) {
-      return yield* failSteer("The requested turn is no longer running. No new turn was started.");
+      return yield* failSteer("The steering request does not match its persisted user message.");
     }
-    const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
-    if (!message || message.role !== "user" || message.turnId !== event.payload.expectedTurnId) {
-      return yield* failSteer("The steering message is not bound to the requested turn.");
-    }
-    const sessions = yield* providerService.listSessions();
-    const session = sessions.find((entry) => entry.threadId === event.payload.threadId);
-    if (
-      session?.provider !== "codex" ||
-      session.status !== "running" ||
-      session.activeTurnId !== event.payload.expectedTurnId
-    ) {
-      return yield* failSteer(
-        "Steering requires a running Codex turn. The message was not queued.",
-      );
-    }
-    yield* providerService
+    // ProviderService requires an existing Codex session. The runtime reads the
+    // provider's active parent turn instead of trusting cached session fields.
+    const result = yield* providerService
       .sendTurn({
         threadId: event.payload.threadId,
         expectedTurnId: event.payload.expectedTurnId,
         input: message.text,
       })
-      .pipe(
-        Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            if (Cause.hasInterruptsOnly(cause)) return yield* Effect.failCause(cause);
-            yield* failSteer(formatFailureDetail(cause));
-          }),
-        ),
+      .pipe(Effect.exit);
+    if (Exit.isFailure(result)) {
+      if (Cause.hasInterruptsOnly(result.cause)) return yield* Effect.failCause(result.cause);
+      return yield* failSteer(
+        `${formatFailureDetail(result.cause)} No new turn was started. Unconfirmed delivery is not replayed automatically.`,
       );
+    }
+    const providerSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === event.payload.threadId,
+    );
+    yield* setThreadSession({
+      preservePendingTurnStart: true,
+      threadId: event.payload.threadId,
+      session: {
+        threadId: event.payload.threadId,
+        status: "running",
+        providerName: "codex",
+        providerInstanceId: providerSession?.providerInstanceId ?? thread.modelSelection.instanceId,
+        runtimeMode: providerSession?.runtimeMode ?? thread.runtimeMode,
+        activeTurnId: result.value.turnId,
+        lastError: null,
+        updatedAt: event.payload.createdAt,
+      },
+      createdAt: event.payload.createdAt,
+    });
+    yield* orchestrationEngine.dispatch({
+      type: "thread.activity.append",
+      commandId: yield* serverCommandId("provider-steer-accepted"),
+      threadId: event.payload.threadId,
+      activity: {
+        id: yield* serverEventId(),
+        tone: "info",
+        kind: "provider.turn.steer.accepted",
+        summary: "Steering accepted by provider",
+        payload: {
+          commandId: event.commandId,
+          messageId: event.payload.messageId,
+          expectedTurnId: event.payload.expectedTurnId,
+          providerTurnId: result.value.turnId,
+          deliveryStatus: "provider-accepted",
+        },
+        turnId: result.value.turnId,
+        createdAt: event.payload.createdAt,
+      },
+      createdAt: event.payload.createdAt,
+    });
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (

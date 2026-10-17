@@ -209,8 +209,10 @@ export function validateAgentAction(
     reject("Thread must be read from this environment before acting.");
   const thread = detail.thread;
   const activeTurnId = thread.session?.activeTurnId;
-  if (command.type === "thread.turn.steer" || command.type === "thread.turn.interrupt") {
-    const turnId = command.type === "thread.turn.steer" ? command.expectedTurnId : command.turnId;
+  // Steering resolves the live provider turn at delivery. Projection fields can
+  // lag or contain child-turn state, so they cannot veto that provider check.
+  if (command.type === "thread.turn.interrupt") {
+    const turnId = command.turnId;
     if (
       !activeTurnId ||
       activeTurnId !== turnId ||
@@ -222,12 +224,8 @@ export function validateAgentAction(
   if (command.type === "thread.turn.start") {
     if (command.runtimeMode !== thread.runtimeMode)
       reject("Send must preserve the thread runtime mode.");
-    if (
-      activeTurnId ||
-      thread.latestTurn?.state === "running" ||
-      thread.session?.status === "starting"
-    )
-      reject("Thread is already running. Use steer with its active turn ID.");
+    // Projection liveness can lag a missed provider completion. The provider
+    // runtime resolves active/idle state; it is the delivery authority.
   }
   if (command.type === "thread.approval.respond" || command.type === "thread.user-input.respond") {
     const kind =

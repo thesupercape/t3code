@@ -599,8 +599,8 @@ describe("follow-up submission choice", () => {
     isEnvironmentUnavailable: false,
   };
 
-  it("steers an active turn even when follow-ups are queued", () => {
-    expect(resolveFollowUpSubmission({ ...base, followUpBehavior: "steer" })).toBe("steer");
+  it("sends immediately even when follow-ups are queued", () => {
+    expect(resolveFollowUpSubmission({ ...base, followUpBehavior: "steer" })).toBe("send");
   });
 
   it("keeps steering available while a provider request awaits a decision", () => {
@@ -610,12 +610,12 @@ describe("follow-up submission choice", () => {
         followUpBehavior: "steer",
         hasPendingRequest: true,
       }),
-    ).toBe("steer");
+    ).toBe("send");
   });
 
-  it("keeps queued follow-ups ahead of new turns when the thread is ready", () => {
+  it("does not let a stale ready projection divert immediate input into the queue", () => {
     expect(resolveFollowUpSubmission({ ...base, phase: "ready", followUpBehavior: "steer" })).toBe(
-      "queue",
+      "send",
     );
   });
 

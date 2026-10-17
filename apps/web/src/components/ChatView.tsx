@@ -5185,59 +5185,6 @@ function ChatViewContent(props: ChatViewProps) {
       isThreadLoading: threadDetailLoading,
       isEnvironmentUnavailable: activeEnvironmentUnavailable,
     });
-    if (!queuedFollowUp && followUpSubmission === "steer" && !sendInFlightRef.current) {
-      const context = currentSendContext;
-      const text = context?.prompt.trim() ?? "";
-      if (
-        !activeThread?.session?.activeTurnId ||
-        !context?.providerAvailable ||
-        context.selectedProvider !== "codex" ||
-        !text ||
-        context.images.length > 0 ||
-        context.terminalContexts.length > 0 ||
-        context.elementContexts.length > 0 ||
-        context.previewAnnotations.length > 0 ||
-        context.reviewComments.length > 0 ||
-        activeEnvironmentUnavailable
-      ) {
-        toastManager.add(
-          stackedThreadToast({
-            type: "info",
-            title: "Cannot steer with this draft",
-            description:
-              "Steering needs an active Codex turn and a text-only draft. Your draft is still here.",
-          }),
-        );
-        return;
-      }
-      sendInFlightRef.current = true;
-      try {
-        const result = await steerThreadTurn({
-          environmentId,
-          input: {
-            threadId: activeThread.id,
-            expectedTurnId: activeThread.session.activeTurnId,
-            text,
-          },
-        });
-        if (result._tag === "Failure") {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not steer the active turn",
-              description: chatActionErrorMessage(squashAtomCommandFailure(result)),
-            }),
-          );
-        } else if (promptRef.current === context.prompt) {
-          promptRef.current = "";
-          clearComposerDraftContent(composerDraftTarget);
-          composerRef.current?.resetCursorState();
-        }
-      } finally {
-        sendInFlightRef.current = false;
-      }
-      return;
-    }
     if (
       activeThreadKey &&
       !queuedFollowUp &&
@@ -5799,6 +5746,9 @@ function ChatViewContent(props: ChatViewProps) {
           titleSeed: title,
           runtimeMode,
           interactionMode,
+          ...(ctxSelectedProvider === "codex" && !queuedFollowUp
+            ? { deliveryMode: "immediate" as const }
+            : {}),
           ...(ctxSubagentBackend !== null ? { subagentBackend: ctxSubagentBackend } : {}),
           ...(bootstrap ? { bootstrap } : {}),
           createdAt: messageCreatedAt,
@@ -5811,6 +5761,10 @@ function ChatViewContent(props: ChatViewProps) {
         failure = startResult;
       } else {
         turnStartSucceeded = true;
+        // The command was persisted, so the composer can accept another
+        // instruction while the provider resolves this immediate delivery.
+        // This is not a provider-delivered receipt.
+        if (ctxSelectedProvider === "codex" && !queuedFollowUp) resetLocalDispatch();
         acknowledgeActiveThreadWoke();
         if (backgroundThreadRef) {
           markPromotedDraftThreadByRef(backgroundThreadRef);
@@ -5962,12 +5916,11 @@ function ChatViewContent(props: ChatViewProps) {
   };
 
   const onSteerQueuedFollowUp = async (entry: QueuedFollowUp) => {
-    const turnId = activeThread?.session?.activeTurnId;
+    const turnId = activeThread?.session?.activeTurnId ?? null;
     if (
       !activeThreadKey ||
       !activeThread ||
-      phase !== "running" ||
-      !turnId ||
+      activeThread.session?.providerName !== "codex" ||
       !canSteerQueuedFollowUp(entry) ||
       sendInFlightRef.current ||
       isSendBusy ||
@@ -6276,6 +6229,7 @@ function ChatViewContent(props: ChatViewProps) {
             },
             modelSelection: ctxSelectedModelSelection,
             titleSeed: activeThread.title,
+            ...(ctxSelectedProvider === "codex" ? { deliveryMode: "immediate" as const } : {}),
             runtimeMode,
             interactionMode: nextInteractionMode,
             ...(ctxSubagentBackend !== null ? { subagentBackend: ctxSubagentBackend } : {}),
@@ -6414,6 +6368,7 @@ function ChatViewContent(props: ChatViewProps) {
           },
           modelSelection: ctxSelectedModelSelection,
           titleSeed: nextThreadTitle,
+          ...(ctxSelectedProvider === "codex" ? { deliveryMode: "immediate" as const } : {}),
           runtimeMode,
           interactionMode: "default",
           ...(ctxSubagentBackend !== null ? { subagentBackend: ctxSubagentBackend } : {}),
@@ -7159,10 +7114,9 @@ function ChatViewContent(props: ChatViewProps) {
                               Send now
                             </button>
                           ) : null}
-                          {phase === "running" &&
-                          selectedProvider === "codex" &&
+                          {selectedProvider === "codex" &&
                           isServerThread &&
-                          activeThread?.session?.activeTurnId &&
+                          activeThread?.session?.providerName === "codex" &&
                           canSteerQueuedFollowUp(entry) ? (
                             <button
                               type="button"
@@ -7197,11 +7151,8 @@ function ChatViewContent(props: ChatViewProps) {
                       key={activeThread.id}
                       environmentId={environmentId}
                       threadId={activeThread.id}
-                      activeTurnId={
-                        activeThread.session?.status === "running"
-                          ? activeThread.session.activeTurnId
-                          : null
-                      }
+                      activeTurnId={activeThread.session?.activeTurnId ?? null}
+                      canSteer={activeThread.session?.providerName === "codex"}
                       disabled={activeEnvironmentUnavailable || isEditingFromHere}
                     />
                   ) : null}

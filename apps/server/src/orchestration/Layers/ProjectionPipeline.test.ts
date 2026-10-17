@@ -2876,6 +2876,98 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
 it.layer(makeProjectionPipelinePrefixedTestLayer("t3-pending-turn-terminal-test-"))(
   "OrchestrationProjectionPipeline pending turn cleanup",
   (it) => {
+    it.effect(
+      "keeps next-turn pending metadata through steering reconciliation and clears only matching immediate receipts",
+      () =>
+        Effect.gen(function* () {
+          const pipeline = yield* OrchestrationProjectionPipeline;
+          const eventStore = yield* OrchestrationEventStore;
+          const sql = yield* SqlClient.SqlClient;
+          const now = "2026-02-26T14:00:00.000Z";
+          for (const scenario of ["steer-other", "steer-own", "fail-own", "start-own"] as const) {
+            const threadId = ThreadId.make(`immediate-${scenario}`);
+            const messageId = MessageId.make(`message-${scenario}`);
+            const base = {
+              aggregateKind: "thread" as const,
+              aggregateId: threadId,
+              occurredAt: now,
+              commandId: CommandId.make(`cmd-${scenario}`),
+              causationEventId: null,
+              correlationId: CorrelationId.make(`cmd-${scenario}`),
+              metadata: {},
+            };
+            yield* eventStore.append({
+              ...base,
+              type: "thread.turn-start-requested",
+              eventId: EventId.make(`pending-${scenario}`),
+              payload: {
+                threadId,
+                messageId,
+                deliveryMode: "immediate",
+                runtimeMode: "approval-required",
+                createdAt: now,
+              },
+            });
+            yield* eventStore.append({
+              ...base,
+              type: "thread.session-set",
+              eventId: EventId.make(`reconcile-${scenario}`),
+              payload: {
+                threadId,
+                preservePendingTurnStart: true,
+                session: {
+                  threadId,
+                  status: "running",
+                  providerName: "codex",
+                  runtimeMode: "full-access",
+                  activeTurnId: TurnId.make(`actual-${scenario}`),
+                  lastError: null,
+                  updatedAt: now,
+                },
+              },
+            });
+            yield* eventStore.append({
+              ...base,
+              type: "thread.activity-appended",
+              eventId: EventId.make(`receipt-${scenario}`),
+              payload: {
+                threadId,
+                activity: {
+                  id: EventId.make(`activity-${scenario}`),
+                  tone: "info",
+                  summary: "Provider receipt",
+                  kind:
+                    scenario === "fail-own"
+                      ? "provider.turn.immediate.failed"
+                      : "provider.turn.immediate.accepted",
+                  payload: {
+                    messageId: scenario === "steer-other" ? "different-message" : messageId,
+                    delivery: scenario === "start-own" ? "start" : "steer",
+                  },
+                  turnId: null,
+                  createdAt: now,
+                },
+              },
+            });
+          }
+          yield* pipeline.bootstrap;
+          const rows = yield* sql<{ threadId: string }>`
+          SELECT thread_id AS "threadId" FROM projection_turns
+          WHERE turn_id IS NULL AND state = 'pending'
+            AND thread_id LIKE 'immediate-%' ORDER BY thread_id
+        `;
+          assert.deepEqual(
+            rows.map((row) => row.threadId),
+            ["immediate-start-own", "immediate-steer-other"],
+          );
+          yield* sql`
+            DELETE FROM projection_turns
+            WHERE thread_id IN ('immediate-start-own', 'immediate-steer-other')
+              AND turn_id IS NULL AND state = 'pending'
+          `;
+        }),
+    );
+
     it.effect("clears pending turn starts when startup reaches a terminal session state", () =>
       Effect.gen(function* () {
         const projectionPipeline = yield* OrchestrationProjectionPipeline;

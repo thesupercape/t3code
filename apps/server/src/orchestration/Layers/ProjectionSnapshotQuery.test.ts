@@ -2260,6 +2260,56 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect(
+    "keeps steering text in paged history when the observed child turn does not exist",
+    () =>
+      Effect.gen(function* () {
+        yield* seedFanOutThread();
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+        const command = {
+          type: "thread.turn.steer",
+          commandId: CommandId.make("steer-nonexistent-child"),
+          threadId: threadW,
+          expectedTurnId: asTurnId("nonexistent-child-turn"),
+          messageId: asMessageId("steering-user-message"),
+          text: "Keep the parent task moving.\nPreserve  this exact text.",
+          createdAt: "2026-03-01T00:04:30.000Z",
+        } as const;
+        const decided = yield* decideOrchestrationCommand({
+          command,
+          readModel: yield* snapshotQuery.getCommandReadModel(),
+        });
+        const events = Array.isArray(decided) ? decided : [decided];
+        const messageEvent = events.find((event) => event.type === "thread.message-sent");
+        const requestEvent = events.find((event) => event.type === "thread.turn-steer-requested");
+        assert.isDefined(messageEvent);
+        assert.isDefined(requestEvent);
+        if (messageEvent === undefined || requestEvent === undefined) return;
+        assert.equal(requestEvent.causationEventId, messageEvent.eventId);
+        assert.equal(requestEvent.payload.expectedTurnId, command.expectedTurnId);
+        const message = messageEvent.payload;
+        yield* sql`
+        INSERT INTO projection_thread_messages (
+          message_id, thread_id, turn_id, role, text, is_streaming, created_at, updated_at
+        )
+        VALUES (${message.messageId}, ${message.threadId}, ${message.turnId}, ${message.role},
+          ${message.text}, 0, ${message.createdAt}, ${message.updatedAt})
+      `;
+
+        const reloaded = yield* snapshotQuery.getThreadDetailSnapshot(threadW, { turnLimit: 1 });
+        assert.equal(reloaded._tag, "Some");
+        if (reloaded._tag === "Some") {
+          assert.deepEqual(
+            reloaded.value.thread.messages
+              .filter((entry) => entry.id === command.messageId)
+              .map(({ text, turnId }) => ({ text, turnId })),
+            [{ text: command.text, turnId: null }],
+          );
+        }
+      }),
+  );
+
   it.effect("subagent turns between user turns ride along inside the window", () =>
     Effect.gen(function* () {
       yield* seedFanOutThread();

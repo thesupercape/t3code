@@ -458,6 +458,42 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }),
   );
 
+  it.effect("retains bound start options when immediate delivery resolves to an idle turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("immediate-bound-options");
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+        modelSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.3-codex", [
+          { id: "reasoningEffort", value: "high" },
+          { id: "serviceTier", value: "priority" },
+          { id: "computerControl", value: "preview" },
+        ]),
+      });
+      const runtime = sessionRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      runtime.sendTurnImpl.mockClear();
+      const runtimeCount = sessionRuntimeFactory.runtimes.length;
+      yield* adapter.sendTurn({
+        threadId,
+        deliveryMode: "immediate",
+        input: "continue",
+        attachments: [],
+      });
+      NodeAssert.deepStrictEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
+        deliveryMode: "immediate",
+        input: "continue",
+        model: "gpt-5.3-codex",
+        effort: "high",
+        serviceTier: "priority",
+        computerControlMode: "preview",
+      });
+      NodeAssert.equal(sessionRuntimeFactory.runtimes.length, runtimeCount);
+    }),
+  );
+
   it.effect("passes both legacy Fast Mode on and off to the native runtime", () =>
     Effect.gen(function* () {
       const adapter = yield* CodexAdapter;

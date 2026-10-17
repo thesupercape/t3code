@@ -69,12 +69,17 @@ export type ProviderSessionStartInput = typeof ProviderSessionStartInput.Type;
 
 export const ProviderSendTurnInput = Schema.Struct({
   threadId: ThreadId,
-  /** Explicit Codex steering. Must match the active provider turn. */
-  expectedTurnId: Schema.optional(TurnId),
+  /** Explicit Codex steering. Null resolves the provider's active parent turn. */
+  expectedTurnId: Schema.optional(Schema.NullOr(TurnId)),
+  /** Resolve Codex provider state at delivery; omitted retains ordinary queue semantics. */
+  deliveryMode: Schema.optional(Schema.Literal("immediate")),
   /** Internal recovery signal for provider sessions resumed after a restart. */
   continuation: Schema.optional(Schema.Boolean),
   input: Schema.optional(
-    TrimmedNonEmptyString.check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS)),
+    Schema.String.check(
+      Schema.isPattern(/\S/),
+      Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_INPUT_CHARS),
+    ),
   ),
   attachments: Schema.optional(
     Schema.Array(ChatAttachment).check(Schema.isMaxLength(PROVIDER_SEND_TURN_MAX_ATTACHMENTS)),
@@ -88,6 +93,7 @@ export type ProviderSendTurnInput = typeof ProviderSendTurnInput.Type;
 export const ProviderTurnStartResult = Schema.Struct({
   threadId: ThreadId,
   turnId: TurnId,
+  delivery: Schema.optional(Schema.Literals(["start", "steer"])),
   resumeCursor: Schema.optional(Schema.Unknown),
 });
 export type ProviderTurnStartResult = typeof ProviderTurnStartResult.Type;

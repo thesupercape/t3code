@@ -59,6 +59,11 @@ import {
 import { isWorkerLifecycleToolName } from "../../worker/WorkerThreadBoundary.ts";
 import { recoverCodexDenyReadAclState } from "./CodexSandboxRecovery.ts";
 import { makeCodexFileChangeApprovalContext } from "./CodexFileChangeApprovalContext.ts";
+import {
+  readCodexActiveTurn,
+  steerCodexActiveTurn,
+  withCodexDeliveryDeadline,
+} from "./CodexTurnSteering.ts";
 import { normalizeServiceTier, type CodexTierObservation } from "../../usage/codexServiceTier.ts";
 import { migrateCodexResumeRollout } from "../Drivers/CodexHomeLayout.ts";
 const decodeV2TurnStartResponse = Schema.decodeUnknownEffect(EffectCodexSchema.V2TurnStartResponse);
@@ -353,7 +358,8 @@ export interface CodexSessionRuntimeOptions {
 }
 
 export interface CodexSessionRuntimeSendTurnInput {
-  readonly expectedTurnId?: TurnId;
+  readonly expectedTurnId?: TurnId | null;
+  readonly deliveryMode?: "immediate";
   readonly input?: string;
   readonly attachments?: ReadonlyArray<{
     readonly type: "image";
@@ -1041,12 +1047,9 @@ function readRouteFields(notification: CodexServerNotification): {
  * synthetic `collabAgent/*` provider events the adapter turns into task.*
  * runtime events (timelineBypass keeps them out of the parent chat).
  *
- * WIP, probe-gated: registration is deliberately explicit-signals-only. The
- * spec's "provisionally treat unknown foreign thread ids as v2 children" rule
- * needs a live wire capture of the packaged binary before it lands — blind
- * capture risks eating unrelated traffic. Until then a child whose first
- * notification precedes registration passes through as today (no regression
- * vs main, which passes everything through).
+ * Registration requires an explicit relationship to this session's root or
+ * an already registered descendant. A shared provider connection can also
+ * deliver other chats' threads; being foreign does not make one our child.
  */
 interface CollabChildAgentState {
   readonly agentThreadId: string;
@@ -1100,6 +1103,7 @@ function rememberCollabReceiverTurns(
   collabReceiverTurns: Map<string, TurnId>,
   notification: CodexServerNotification,
   parentTurnId: TurnId | undefined,
+  rootThreadId: string,
 ): void {
   if (!parentTurnId) {
     return;
@@ -1114,7 +1118,9 @@ function rememberCollabReceiverTurns(
   }
 
   for (const receiverThreadId of notification.params.item.receiverThreadIds) {
-    collabReceiverTurns.set(receiverThreadId, parentTurnId);
+    if (receiverThreadId !== rootThreadId) {
+      collabReceiverTurns.set(receiverThreadId, parentTurnId);
+    }
   }
 }
 
@@ -1173,6 +1179,7 @@ const CHILD_CHATTER_METHODS: ReadonlySet<string> = new Set([
   "turn/diff/updated",
   "thread/name/updated",
   "thread/settings/updated",
+  "model/rerouted",
   "rawResponseItem/completed",
   // Keep child-owned thread state out of the parent lifecycle.
   "thread/archived",
@@ -1458,6 +1465,17 @@ export const makeCodexSessionRuntime = (
           if (!spawn) {
             return false;
           }
+          const rootThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+          const children = yield* Ref.get(collabChildAgentsRef);
+          const parentThreadId = spawn.parentThreadId ?? thread.parentThreadId;
+          if (
+            !rootThreadId ||
+            (parentThreadId !== rootThreadId &&
+              !children.has(parentThreadId ?? "") &&
+              !(yield* Ref.get(collabReceiverTurnsRef)).has(thread.id))
+          ) {
+            return true;
+          }
           // Merge with any subAgentActivity registration that got here
           // first. spawnTurnId is REGISTRATION-time-only on both paths: for
           // an already-known child we keep its value (set or unset) — a
@@ -1516,6 +1534,14 @@ export const makeCodexSessionRuntime = (
           // assistant message and turn/completed — so the thread hung
           // "working" after all subagents finished (live-probe finding).
           const rootProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+          const ownerThreadId = notification.params.threadId;
+          if (
+            !rootProviderThreadId ||
+            (ownerThreadId !== rootProviderThreadId &&
+              !(yield* Ref.get(collabChildAgentsRef)).has(ownerThreadId))
+          ) {
+            return true;
+          }
           if (
             item.agentThreadId === rootProviderThreadId ||
             item.agentPath === "/root" ||
@@ -1759,6 +1785,9 @@ export const makeCodexSessionRuntime = (
       Effect.gen(function* () {
         const isMemoryConsolidationNotification =
           suppressMemoryConsolidationNotification(notification);
+        if (isMemoryConsolidationNotification) {
+          return;
+        }
 
         const payload = notification.params;
         const route = readRouteFields(notification);
@@ -1770,7 +1799,22 @@ export const makeCodexSessionRuntime = (
             : undefined;
         })();
 
-        rememberCollabReceiverTurns(collabReceiverTurns, notification, route.turnId);
+        const rootThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+        const notificationThreadId = readNotificationThreadId(notification);
+        if (
+          rootThreadId &&
+          (notificationThreadId === rootThreadId ||
+            (notificationThreadId !== undefined &&
+              (yield* Ref.get(collabChildAgentsRef)).has(notificationThreadId)))
+        ) {
+          const owner = (yield* Ref.get(collabChildAgentsRef)).get(notificationThreadId ?? "");
+          rememberCollabReceiverTurns(
+            collabReceiverTurns,
+            notification,
+            owner ? owner.spawnTurnId : route.turnId,
+            rootThreadId,
+          );
+        }
         // Interception FIRST: a registered v2 child is usually also in the
         // receiver-turn map (collabAgentToolCall.receiverThreadIds), and the
         // legacy suppressor below would drop its lifecycle before it could
@@ -1806,8 +1850,8 @@ export const makeCodexSessionRuntime = (
           // registers it (captured ordering), and suppressing it without
           // remembering the live turn would leave that child running after
           // Stop (review finding). Track live turns for ANY foreign
-          // conversation; interrupts are best-effort per child, so a
-          // false-positive entry costs one ignored RPC at worst.
+          // conversation provisionally, but interrupt only after an explicit
+          // relationship establishes that it belongs to this parent.
           const foreignThreadId = readNotificationThreadId(notification);
           if (foreignThreadId !== undefined) {
             if (notification.method === "turn/started") {
@@ -1837,7 +1881,16 @@ export const makeCodexSessionRuntime = (
           return;
         }
 
-        if (isMemoryConsolidationNotification) {
+        // Only explicit relationships authorize routing foreign traffic to
+        // this parent. In particular, early child items and unrelated chat
+        // messages must not enter its timeline before registration.
+        if (
+          notificationThreadId !== undefined &&
+          (!rootThreadId ||
+            (notificationThreadId !== rootThreadId &&
+              childParentTurnId === undefined &&
+              !(yield* Ref.get(collabChildAgentsRef)).has(notificationThreadId)))
+        ) {
           return;
         }
 
@@ -1888,7 +1941,7 @@ export const makeCodexSessionRuntime = (
     yield* client.handleServerNotification("thread/started", (payload) =>
       currentSessionProviderThreadId.pipe(
         Effect.flatMap((providerThreadId) => {
-          if (providerThreadId && payload.thread.id !== providerThreadId) {
+          if (!providerThreadId || payload.thread.id !== providerThreadId) {
             return Effect.void;
           }
           return updateSession(sessionRef, {
@@ -1901,7 +1954,7 @@ export const makeCodexSessionRuntime = (
     yield* client.handleServerNotification("turn/started", (payload) =>
       currentSessionProviderThreadId.pipe(
         Effect.flatMap((providerThreadId) => {
-          if (providerThreadId && payload.threadId !== providerThreadId) {
+          if (!providerThreadId || payload.threadId !== providerThreadId) {
             return Effect.void;
           }
           return updateSession(sessionRef, {
@@ -1915,7 +1968,7 @@ export const makeCodexSessionRuntime = (
     yield* client.handleServerNotification("turn/completed", (payload) =>
       currentSessionProviderThreadId.pipe(
         Effect.flatMap((providerThreadId) => {
-          if (providerThreadId && payload.threadId !== providerThreadId) {
+          if (!providerThreadId || payload.threadId !== providerThreadId) {
             return Effect.void;
           }
           const lastError =
@@ -1935,7 +1988,7 @@ export const makeCodexSessionRuntime = (
       currentSessionProviderThreadId.pipe(
         Effect.flatMap((providerThreadId) => {
           const payloadThreadId = payload.threadId;
-          if (providerThreadId && payloadThreadId && payloadThreadId !== providerThreadId) {
+          if (!providerThreadId || (payloadThreadId && payloadThreadId !== providerThreadId)) {
             return Effect.void;
           }
           const errorMessage = payload.error.message;
@@ -2450,19 +2503,42 @@ export const makeCodexSessionRuntime = (
       sendTurn: (input) =>
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
-          if (input.expectedTurnId !== undefined) {
+          const readThread = client.raw.request("thread/read", {
+            threadId: providerThreadId,
+            includeTurns: true,
+          });
+          const providerActiveTurnId =
+            input.expectedTurnId === undefined
+              ? yield* readCodexActiveTurn({ providerThreadId, readThread })
+              : null;
+          const immediateActiveTurnId =
+            input.deliveryMode === "immediate" ? providerActiveTurnId : null;
+          if (input.expectedTurnId !== undefined || immediateActiveTurnId !== null) {
             const turnInput: Array<EffectCodexSchema.V2TurnSteerParams["input"][number]> = [];
             if (input.input) turnInput.push({ type: "text", text: input.input });
             turnInput.push(...(input.attachments ?? []));
-            const response = yield* client.request("turn/steer", {
-              threadId: providerThreadId,
-              expectedTurnId: input.expectedTurnId,
-              input: turnInput,
+            const response = yield* steerCodexActiveTurn({
+              providerThreadId,
+              readThread,
+              ...(immediateActiveTurnId !== null
+                ? { initialActiveTurnId: immediateActiveTurnId }
+                : {}),
+              steerTurn: (activeTurnId) =>
+                client.request("turn/steer", {
+                  threadId: providerThreadId,
+                  expectedTurnId: activeTurnId,
+                  input: turnInput,
+                }),
+            });
+            yield* updateSession(sessionRef, {
+              status: "running",
+              activeTurnId: TurnId.make(response.turnId),
             });
             return {
               threadId: options.threadId,
               turnId: TurnId.make(response.turnId),
               resumeCursor: { threadId: providerThreadId },
+              ...(input.deliveryMode === "immediate" ? { delivery: "steer" as const } : {}),
             } satisfies ProviderTurnStartResult;
           }
           const computerControlMode =
@@ -2503,7 +2579,10 @@ export const makeCodexSessionRuntime = (
             computerControlMode,
             computerControlAvailable: browserAvailability.managedChrome,
           });
-          const rawResponse = yield* client.raw.request("turn/start", params);
+          const rawResponse = yield* withCodexDeliveryDeadline(
+            "turn/start",
+            client.raw.request("turn/start", params),
+          );
           const response = yield* decodeV2TurnStartResponse(rawResponse).pipe(
             Effect.mapError((error) =>
               CodexErrors.CodexAppServerProtocolParseError.fromSchemaError(
@@ -2522,18 +2601,20 @@ export const makeCodexSessionRuntime = (
               serviceTier: currentServiceTier,
             });
           }
-          yield* updateSession(sessionRef, (session) => ({
+          yield* updateSession(sessionRef, {
             status: "running",
             // Codex accepts follow-ups while the current turn is still
             // running. The response contains the queued turn id, but
             // turn/interrupt only accepts the id that is active now.
-            activeTurnId: session.activeTurnId ?? turnId,
+            activeTurnId:
+              providerActiveTurnId !== null ? TurnId.make(providerActiveTurnId) : turnId,
             ...(normalizedModel ? { model: normalizedModel } : {}),
-          }));
+          });
           const resumedProviderThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
           return {
             threadId: options.threadId,
             turnId,
+            ...(input.deliveryMode === "immediate" ? { delivery: "start" as const } : {}),
             ...(resumedProviderThreadId
               ? { resumeCursor: { threadId: resumedProviderThreadId } }
               : {}),
@@ -2552,8 +2633,12 @@ export const makeCodexSessionRuntime = (
           // (review finding). Per-child and overall deadlines guarantee the
           // parent interrupt below always runs.
           const liveChildTurns = yield* Ref.get(collabChildLiveTurnsRef);
+          const children = yield* Ref.get(collabChildAgentsRef);
+          const receivers = yield* Ref.get(collabReceiverTurnsRef);
           yield* Effect.forEach(
-            Array.from(liveChildTurns.entries()),
+            Array.from(liveChildTurns.entries()).filter(
+              ([childThreadId]) => children.has(childThreadId) || receivers.has(childThreadId),
+            ),
             ([childThreadId, childTurnId]) =>
               client
                 .request("turn/interrupt", {

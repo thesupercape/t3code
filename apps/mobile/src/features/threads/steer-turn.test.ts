@@ -32,27 +32,31 @@ describe("mobile turn steering", () => {
     });
   });
 
-  it("exposes the current target without submitting before the dialog opens", () => {
+  it("can submit a provider-resolved target without a projected turn ID", () => {
     expect(resolveMobileSteering({ ...input, targetTurnId: null })).toEqual({
       activeTurnId: targetTurnId,
-      targetIsRunning: false,
-      submission: null,
+      canSteer: true,
+      submission: { threadId, expectedTurnId: null, text: "Focus on tests" },
     });
   });
 
-  it("does not retarget an open dialog when another turn starts", () => {
+  it("lets the provider resolve a stale captured turn without inventing a replacement", () => {
     const nextTurnId = TurnId.make("turn-next");
     expect(
       resolveMobileSteering({ ...input, session: { ...session, activeTurnId: nextTurnId } }),
-    ).toEqual({ activeTurnId: nextTurnId, targetIsRunning: false, submission: null });
+    ).toMatchObject({
+      activeTurnId: nextTurnId,
+      canSteer: true,
+      submission: { expectedTurnId: targetTurnId },
+    });
   });
 
   it.each(["idle", "starting", "ready", "interrupted", "stopped", "error"] as const)(
-    "rejects a %s session even if its old turn ID remains",
+    "does not veto a bound Codex %s projection",
     (status) => {
       expect(
         resolveMobileSteering({ ...input, session: { ...session, status } }).submission,
-      ).toBeNull();
+      ).toMatchObject({ expectedTurnId: targetTurnId });
     },
   );
 
@@ -65,20 +69,26 @@ describe("mobile turn steering", () => {
     },
   );
 
-  it("rejects missing, stale-thread, and missing-turn sessions", () => {
-    for (const currentSession of [
-      null,
-      { ...session, threadId: ThreadId.make("other-thread") },
-      { ...session, activeTurnId: null },
-    ]) {
+  it("rejects missing and stale-thread sessions", () => {
+    for (const currentSession of [null, { ...session, threadId: ThreadId.make("other-thread") }]) {
       expect(resolveMobileSteering({ ...input, session: currentSession }).submission).toBeNull();
     }
+  });
+
+  it("allows starting without a projected turn ID", () => {
+    expect(
+      resolveMobileSteering({
+        ...input,
+        session: { ...session, status: "starting", activeTurnId: null },
+        targetTurnId: null,
+      }).submission,
+    ).toEqual({ threadId, expectedTurnId: null, text: "Focus on tests" });
   });
 
   it("blocks disconnected or editing actions without changing the captured turn", () => {
     const state = resolveMobileSteering({ ...input, disabled: true });
     expect(state.submission).toBeNull();
-    expect(state.targetIsRunning).toBe(true);
+    expect(state.canSteer).toBe(true);
   });
 
   it("blocks blank instructions and repeated submissions", () => {
@@ -86,7 +96,7 @@ describe("mobile turn steering", () => {
     expect(resolveMobileSteering({ ...input, submitting: true }).submission).toBeNull();
   });
 
-  it("allows retry only while the original turn is still active", () => {
+  it("does not infer an ended parent from a different projected turn on retry", () => {
     expect(resolveMobileSteering({ ...input, submitting: false }).submission?.expectedTurnId).toBe(
       targetTurnId,
     );
@@ -96,6 +106,6 @@ describe("mobile turn steering", () => {
         submitting: false,
         session: { ...session, activeTurnId: TurnId.make("replacement") },
       }).submission,
-    ).toBeNull();
+    ).toMatchObject({ expectedTurnId: targetTurnId });
   });
 });

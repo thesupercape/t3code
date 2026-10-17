@@ -927,7 +927,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const routed = yield* resolveRoutableSession({
         threadId: input.threadId,
         operation: "ProviderService.sendTurn",
-        allowRecovery: input.expectedTurnId === undefined,
+        allowRecovery: input.expectedTurnId === undefined && input.deliveryMode !== "immediate",
       });
       metricProvider = routed.adapter.provider;
       if (
@@ -949,7 +949,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         );
       }
       const activeModelSelection =
-        input.expectedTurnId !== undefined
+        input.expectedTurnId !== undefined ||
+        (input.deliveryMode === "immediate" && routed.adapter.provider === "codex")
           ? routed.modelSelection
           : (input.modelSelection ?? routed.modelSelection);
       metricModel = activeModelSelection?.model;
@@ -963,7 +964,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       // rather than issuing a new one: sessions that go a long time between
       // browser tool calls used to lose the toolkit outright.
       yield* McpSessionRegistry.touchActiveMcpThread(input.threadId, activeModelSelection);
-      const turn = yield* routed.adapter.sendTurn(input);
+      const turn = yield* routed.adapter.sendTurn(
+        input.deliveryMode === "immediate"
+          ? {
+              ...input,
+              ...(activeModelSelection !== undefined
+                ? { modelSelection: activeModelSelection }
+                : {}),
+            }
+          : input,
+      );
       yield* McpSessionRegistry.touchActiveMcpThread(
         input.threadId,
         activeModelSelection,

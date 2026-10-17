@@ -36,15 +36,22 @@ On web and desktop, **Settings → General → Follow-up behavior** controls wha
 Send does during an active turn. **Queue** holds your message until the turn
 finishes. The queue appears above the composer; you can remove a message or
 send the first one when the thread is ready. Text-only queued messages also
-offer **Steer now** while a Codex turn is running. New turns do not skip
-messages already in the queue. Stop holds queued messages until you choose
+offer **Steer now** for a bound Codex conversation. Queued turns stay in order.
+Stop holds queued messages until you choose
 **Send now**.
 
-**Steer** sends a text-only Codex prompt into the active turn. If the draft has
-an attachment or other context, T3 Code leaves it in the composer and asks you
-to send it after the turn. A steer request that fails also leaves the draft
-intact. Queued follow-ups do not block a new steering instruction; they remain
-queued for later turns.
+**Steer** makes Send deliver immediately. Codex checks its actual conversation:
+it steers the current parent turn when one is running, or starts one turn when
+idle. A stale starting or ready indicator does not decide where the message goes.
+Queued follow-ups do not block an immediate instruction; they remain queued for
+later turns. Unsupported active-turn input produces an unconfirmed-delivery
+notice instead of starting a replacement turn.
+
+**Steer active turn** is a separate text-only action on web, desktop and mobile.
+Codex resolves the current parent turn even when T3 has not received its turn ID
+yet. This action never starts or queues another turn. A saved message or cleared
+composer does not by itself prove provider delivery. If delivery is unconfirmed,
+check the conversation before resending; T3 does not automatically replay it.
 
 The web and desktop follow-up queue survives thread switches and reconnects in
 the same page. It is held in memory because drafts may include local files. A
