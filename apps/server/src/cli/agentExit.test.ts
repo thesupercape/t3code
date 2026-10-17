@@ -50,7 +50,10 @@ it.effect("session cleanup failure leaves stdout as one JSON result", () =>
       { concurrency: "unbounded" },
     );
     expect(Number(code)).toBe(0);
-    expect(JSON.parse(output)).toEqual({ ok: true });
+    const result = yield* Schema.decodeUnknownEffect(
+      Schema.fromJsonString(Schema.Struct({ ok: Schema.Boolean })),
+    )(output);
+    expect(result).toEqual({ ok: true });
     expect(error).toContain("Agent session cleanup failed; the session expires after two minutes.");
     expect(output + error).not.toContain("private");
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
