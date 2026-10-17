@@ -9,6 +9,53 @@ import { handleAgentCliFailure } from "./agent.ts";
 
 const encodeString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
 
+it.effect("session cleanup failure leaves stdout as one JSON result", () =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const path = yield* Path.Path;
+    const cwd = yield* path.fromFileUrl(new URL("../../", import.meta.url));
+    const source = `
+      import * as Effect from 'effect/Effect';
+      import * as Console from 'effect/Console';
+      import * as NodeRuntime from '@effect/platform-node/NodeRuntime';
+      import { withAgentSession } from ${encodeString(new URL("./agent.ts", import.meta.url).href)};
+      const auth = {
+        issueSession: () => Effect.succeed({sessionId:'synthetic', token:'private-test-token'}),
+        revokeSession: () => Effect.fail(new Error('private cleanup payload')),
+      };
+      NodeRuntime.runMain(withAgentSession(auth, false, () => Effect.succeed({ok:true}))
+        .pipe(Effect.flatMap(result => Console.log(JSON.stringify(result)))));
+    `;
+    const child = yield* spawner.spawn(
+      ChildProcess.make(process.execPath, ["--input-type=module", "-e", source], { cwd }),
+    );
+    const [output, error, code] = yield* Effect.all(
+      [
+        child.stdout.pipe(
+          Stream.decodeText(),
+          Stream.runFold(
+            () => "",
+            (all, text) => all + text,
+          ),
+        ),
+        child.stderr.pipe(
+          Stream.decodeText(),
+          Stream.runFold(
+            () => "",
+            (all, text) => all + text,
+          ),
+        ),
+        child.exitCode,
+      ],
+      { concurrency: "unbounded" },
+    );
+    expect(Number(code)).toBe(0);
+    expect(JSON.parse(output)).toEqual({ ok: true });
+    expect(error).toContain("Agent session cleanup failed; the session expires after two minutes.");
+    expect(output + error).not.toContain("private");
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("unrelated operation failures remain typed failures", () =>
   Effect.gen(function* () {
     const failure = new Error("Unexpected failure");

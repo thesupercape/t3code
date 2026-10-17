@@ -250,9 +250,7 @@ export const withAgentSession = <A, E, R>(
         .revokeSession(issued.sessionId)
         .pipe(
           Effect.catch(() =>
-            Effect.logWarning(
-              "Agent session cleanup failed; the session expires after two minutes.",
-            ),
+            Console.error("Agent session cleanup failed; the session expires after two minutes."),
           ),
         ),
   );
